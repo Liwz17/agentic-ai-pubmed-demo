@@ -1,2 +1,4 @@
 from .pubmed import query_pubmed
-from .stats import summarize_papers_stats
+from .stats import summarize_papers_stats, summarize_trial_linking_results
+from .trials import search_clinical_trials
+from .pubmed_trials import _run_pubmed_query_once, _make_pubmed_client, _normalize_pubmed_results, query_pubmed_trial, build_structured_pubmed_query, extract_trial_retrieval_fields, build_query_B_llm,build_query_A, build_query_C

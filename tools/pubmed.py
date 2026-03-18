@@ -7,7 +7,7 @@ def query_pubmed(query, max_papers=DEFAULT_MAX_PAPERS, max_retries=DEFAULT_MAX_R
     """Query PubMed and return structured paper results."""
 
     try:
-        pubmed = PubMed(tool="AgenticAI", email="your_email@example.com")
+        pubmed = PubMed(tool="AgenticAI", email="wli13@mdanderson.org")
 
         papers = list(pubmed.query(query, max_results=max_papers))
 
@@ -41,3 +41,5 @@ def query_pubmed(query, max_papers=DEFAULT_MAX_PAPERS, max_retries=DEFAULT_MAX_R
     except Exception as e:
         print(f"Error querying PubMed: {e}")
         return []
+    
+    
