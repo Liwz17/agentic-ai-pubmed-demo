@@ -1,6 +1,8 @@
 import time
 from typing import List, Dict, Any, Optional
 from pymed import PubMed
+import requests
+import xml.etree.ElementTree as ET
 
 DEFAULT_MAX_PAPERS = 10
 PUBMED_SLEEP_SECONDS = 0.5
@@ -340,3 +342,63 @@ def build_query_C(fields: dict) -> str:
     clauses.append("(Clinical Trial[Publication Type])")
 
     return " AND ".join([c for c in clauses if c])
+
+
+def fetch_pubmed_abstract(pubmed_id: str) -> Dict[str, Any]:
+    """
+    Fetch title + abstract from PubMed using E-utilities.
+    Returns:
+        {
+            "pubmed_id": ...,
+            "title": ...,
+            "abstract": ...,
+            "journal": ...,
+            "year": ...
+        }
+    """
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    params = {
+        "db": "pubmed",
+        "id": pubmed_id,
+        "retmode": "xml",
+    }
+
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+
+    root = ET.fromstring(resp.text)
+
+    article = root.find(".//PubmedArticle")
+    if article is None:
+        raise ValueError(f"No PubMed article found for PMID={pubmed_id}")
+
+    title_node = article.find(".//ArticleTitle")
+    title = "".join(title_node.itertext()).strip() if title_node is not None else ""
+
+    abstract_nodes = article.findall(".//Abstract/AbstractText")
+    abstract_parts = []
+    for node in abstract_nodes:
+        label = node.attrib.get("Label", "").strip()
+        section_text = "".join(node.itertext()).strip()
+        if label:
+            abstract_parts.append(f"{label}: {section_text}")
+        else:
+            abstract_parts.append(section_text)
+
+    abstract = "\n".join([x for x in abstract_parts if x])
+
+    journal_node = article.find(".//Journal/Title")
+    journal = "".join(journal_node.itertext()).strip() if journal_node is not None else ""
+
+    year = ""
+    year_node = article.find(".//PubDate/Year")
+    if year_node is not None and year_node.text:
+        year = year_node.text.strip()
+
+    return {
+        "pubmed_id": pubmed_id,
+        "title": title,
+        "abstract": abstract,
+        "journal": journal,
+        "year": year,
+    }

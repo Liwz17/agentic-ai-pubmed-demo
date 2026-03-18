@@ -1,8 +1,8 @@
 from llm import llm_parse_query
 from tools import search_clinical_trials, summarize_trial_linking_results
-from linker import link_trials_to_pubmed, link_one_trial
+from linker import link_trials_to_pubmed, link_one_trial, extract_survival_from_link_result
 import pandas as pd
-
+import json
 
 
 
@@ -95,6 +95,7 @@ def run_agentic_app(user_input: str, mode: str = "hybrid", page_size: int = 10):
             "trials": df_trials,
             "selected_trial_index": None,
             "link_result": None,
+            "survival_result": None,
         }
 
     selected_trial_idx = _select_trial_interactively(df_trials, page_size=page_size)
@@ -106,6 +107,7 @@ def run_agentic_app(user_input: str, mode: str = "hybrid", page_size: int = 10):
             "trials": df_trials,
             "selected_trial_index": None,
             "link_result": None,
+            "survival_result": None,
         }
 
     trial_row = df_trials.iloc[selected_trial_idx].to_dict()
@@ -122,16 +124,22 @@ def run_agentic_app(user_input: str, mode: str = "hybrid", page_size: int = 10):
         verbose=True,
     )
 
-    print("\n[Step 5] Final result:")
+    print("\n[Step 5] Final link result:")
     print(result["judge_result"])
+
+    print("\n[Step 6] Extracting median OS and 95% CI by treatment arm...")
+    survival_result = extract_survival_from_link_result(result)
+
+    print("\n=== Survival Extraction Result ===")
+    print(json.dumps(survival_result["survival_extraction"], indent=2, ensure_ascii=False))
 
     return {
         "query": structured_query,
         "trials": df_trials,
         "selected_trial_index": selected_trial_idx,
         "link_result": result,
+        "survival_result": survival_result,
     }
-
 
 if __name__ == "__main__":
     user_input = input("Enter your trial search request: ").strip()

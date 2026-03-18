@@ -1,7 +1,7 @@
 from typing import Dict, Any, List, Optional
 import pandas as pd
 from tools import query_pubmed
-from llm import rerank_papers, llm_extract_trial_semantic_terms, llm_judge_trial_papers
+from llm import rerank_papers, llm_extract_trial_semantic_terms, llm_judge_trial_papers, llm_extract_survival_from_text
 import re
 from tools import (
     extract_trial_retrieval_fields,
@@ -9,6 +9,7 @@ from tools import (
     build_query_B_llm,
     build_query_C,
     _run_pubmed_query_once,
+    fetch_pubmed_abstract,
 )
 
 
@@ -326,4 +327,46 @@ def link_one_trial(
         "papers_C": papers_C,
         "all_candidates": all_candidates,
         "judge_result": judge_result,
+    }
+
+
+def extract_survival_from_link_result(link_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Use selected PubMed paper from link_result and extract median OS by arm.
+    """
+    judge_result = link_result.get("judge_result", {})
+    pubmed_id = judge_result.get("selected_pubmed_id")
+
+    if not pubmed_id:
+        return {
+            "status": "error",
+            "message": "No selected_pubmed_id found in link_result['judge_result']",
+            "pubmed_record": None,
+            "survival_extraction": None,
+        }
+
+    pubmed_record = fetch_pubmed_abstract(pubmed_id)
+
+    if not pubmed_record.get("abstract"):
+        return {
+            "status": "warning",
+            "message": f"Abstract not found for PMID={pubmed_id}",
+            "pubmed_record": pubmed_record,
+            "survival_extraction": {
+                "paper_id": pubmed_id,
+                "outcome_found": False,
+                "outcome_type": "overall_survival",
+                "source_used": "abstract",
+                "arms": [],
+                "notes": "No abstract available from PubMed.",
+            },
+        }
+
+    extraction = llm_extract_survival_from_text(pubmed_record)
+
+    return {
+        "status": "ok",
+        "message": "Survival extraction completed.",
+        "pubmed_record": pubmed_record,
+        "survival_extraction": extraction,
     }
