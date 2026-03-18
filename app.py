@@ -15,17 +15,34 @@ def run_agentic_app(user_input: str, mode: str = "hybrid"):
 
     if df_trials.empty:
         print("No trials found.")
-        return {"query": structured_query, "trials": df_trials, "links": pd.DataFrame(), "stats": {}}
+        return {
+            "query": structured_query,
+            "trials": df_trials,
+            "link_result": None,
+        }
 
-    print("\n[Step 3] Sample trials:")
+    print("\n[Step 3] Candidate trials:")
     cols = [c for c in ["nct_id", "brief_title", "start_date", "phases"] if c in df_trials.columns]
-    print(df_trials[cols].head())
+    display_df = df_trials[cols].head(10).copy()
+    display_df = display_df.reset_index(drop=True)
+    print(display_df)
+
+    while True:
+        try:
+            choice = input("\nEnter trial index to link to PubMed (0-9): ").strip()
+            trial_idx = int(choice)
+
+            if 0 <= trial_idx < len(display_df):
+                break
+            else:
+                print("Index out of range. Please enter a valid number.")
+        except ValueError:
+            print("Invalid input. Please enter an integer.")
 
     from linker import link_one_trial
 
-    print("\n[Step 4] Linking ONE trial to PubMed papers...")
-
-    trial_row = df_trials.iloc[1].to_dict()
+    print(f"\n[Step 4] Linking selected trial #{trial_idx} to PubMed papers with mode = {mode} ...")
+    trial_row = df_trials.iloc[trial_idx].to_dict()
 
     result = link_one_trial(
         trial_row,
@@ -35,17 +52,18 @@ def run_agentic_app(user_input: str, mode: str = "hybrid"):
         verbose=True
     )
 
-    print("\n[Step 5] Final judge result:")
+    print("\n[Step 5] Final result:")
     print(result["judge_result"])
 
     return {
         "query": structured_query,
         "trials": df_trials,
+        "selected_trial_index": trial_idx,
         "link_result": result,
     }
 
-
 if __name__ == "__main__":
-    user_input = "Find phase II lung cancer trials with pembrolizumab or ipilimumab started between 2016 and 2020, and check whether their results were published in PubMed."
+    user_input = input("Enter your trial search request: ").strip()
+    mode = input("Choose mode ('nct_only' or 'hybrid') [default: hybrid]: ").strip() or "hybrid"
 
-    results = run_agentic_app(user_input, mode="nct_only")
+    results = run_agentic_app(user_input, mode=mode)
