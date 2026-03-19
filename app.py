@@ -1,5 +1,5 @@
 from llm import llm_parse_query
-from tools import search_clinical_trials, summarize_trial_linking_results
+from tools import search_clinical_trials, summarize_trial_linking_results, draw_single_trial_forest_plot
 from linker import link_trials_to_pubmed, link_one_trial, extract_survival_from_link_result
 import pandas as pd
 import json
@@ -133,13 +133,21 @@ def run_agentic_app(user_input: str, mode: str = "hybrid", page_size: int = 10):
     print("\n=== Survival Extraction Result ===")
     print(json.dumps(survival_result["survival_extraction"], indent=2, ensure_ascii=False))
 
-    return {
-        "query": structured_query,
-        "trials": df_trials,
-        "selected_trial_index": selected_trial_idx,
-        "link_result": result,
-        "survival_result": survival_result,
-    }
+
+    # ✅ Step 7: draw forest plot (single trial)
+    plot_rows = survival_result["survival_extraction"].get("plot_rows", [])
+
+    if plot_rows:
+        print("\n[Step 7] Drawing forest plot for selected trial...")
+
+        trial_label = trial_row.get("brief_title")  
+
+        draw_single_trial_forest_plot(
+            plot_rows,
+            trial_label=trial_label
+        )
+    else:
+        print("\n[Step 7] No plot data available.")
 
 if __name__ == "__main__":
     user_input = input("Enter your trial search request: ").strip()

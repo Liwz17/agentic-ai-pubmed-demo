@@ -338,15 +338,102 @@ Return ONLY JSON in this format:
         raise ValueError("LLM did not return valid JSON for trial-paper judge:\n" + content)
     
 
+
+def _to_float_or_none(x):
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "":
+        return None
+    if s.lower() in {"nr", "not reached", "na", "n/a", "none", "null"}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _normalize_unit(unit: Optional[str]) -> Optional[str]:
+    if unit is None:
+        return None
+    u = str(unit).strip().lower()
+    if u in {"month", "months", "mo", "mos"}:
+        return "months"
+    if u in {"year", "years", "yr", "yrs"}:
+        return "years"
+    return u if u else None
+
+def build_plot_rows_from_extraction(
+    extraction_result: Dict[str, Any],
+    trial_id: Optional[str] = None,
+    trial_label: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Convert extraction-rich result into plot-ready rows (NO unit conversion).
+
+    Each returned row corresponds to one treatment arm.
+    Units are preserved exactly as extracted.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    if not extraction_result.get("outcome_found", False):
+        return rows
+
+    paper_id = extraction_result.get("paper_id")
+    source_used = extraction_result.get("source_used")
+    arms = extraction_result.get("arms", [])
+
+    for arm in arms:
+        arm_name = arm.get("arm_name", "unknown arm")
+
+        median_os_value = _to_float_or_none(arm.get("median_os_value"))
+        median_os_unit = _normalize_unit(arm.get("median_os_unit"))
+
+        ci_lower = _to_float_or_none(arm.get("ci_lower"))
+        ci_upper = _to_float_or_none(arm.get("ci_upper"))
+        ci_unit = _normalize_unit(arm.get("ci_unit")) or median_os_unit
+
+        plot_eligible = median_os_value is not None
+
+        rows.append({
+            "trial_id": trial_id,
+            "trial_label": trial_label,
+            "paper_id": paper_id,
+            "source_used": source_used,
+
+            "arm_name": arm_name,
+            "display_label": f"{trial_label} | {arm_name}" if trial_label else arm_name,
+
+            "median_os_raw": arm.get("median_os_raw"),
+            "ci_95_raw": arm.get("ci_95_raw"),
+            "median_os_value": median_os_value,
+            "median_os_unit": median_os_unit,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "ci_unit": ci_unit,
+
+            # metadata
+            "plot_eligible": plot_eligible,
+            "evidence": arm.get("evidence", "")
+        })
+
+    return rows
+
+
 def llm_extract_survival_from_text(
     pubmed_record: Dict[str, Any],
     full_text: Optional[str] = None,
+    trial_id: Optional[str] = None,
+    trial_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Use LLM to extract median overall survival (OS) and 95% CI by treatment arm
     from abstract or full text.
 
-    Returns:
+    Returns a dict with two levels:
+    1. arms       -> extraction-rich structure for question (c)
+    2. plot_rows  -> normalized rows for forest plot preparation in (d)
+
+    Return example:
     {
         "paper_id": "32199466",
         "outcome_found": true,
@@ -354,10 +441,29 @@ def llm_extract_survival_from_text(
         "source_used": "abstract",
         "arms": [
             {
-                "arm_name": "pembrolizumab",
-                "median_os": "9.8",
-                "ci_95": "7.1-14.6",
+                "arm_name": "Pembrolizumab",
+                "median_os_raw": "9.8 months",
+                "median_os_value": "9.8",
+                "median_os_unit": "months",
+                "ci_95_raw": "7.1 to 14.6",
+                "ci_lower": "7.1",
+                "ci_upper": "14.6",
+                "ci_unit": "months",
                 "evidence": "Median overall survival was 9.8 months (95% CI 7.1-14.6)."
+            }
+        ],
+        "plot_rows": [
+            {
+                "trial_id": "NCTxxxx",
+                "trial_label": "PePS2",
+                "paper_id": "32199466",
+                "arm_name": "Pembrolizumab",
+                "display_label": "PePS2 | Pembrolizumab",
+                "median_os_months": 9.8,
+                "ci_lower_months": 7.1,
+                "ci_upper_months": 14.6,
+                "plot_eligible": true,
+                "evidence": "..."
             }
         ],
         "notes": "single-arm trial"
@@ -367,14 +473,16 @@ def llm_extract_survival_from_text(
     source_used = "full_text" if full_text else "abstract"
 
     if not source_text or not str(source_text).strip():
-        return {
+        empty_result = {
             "paper_id": str(pubmed_record.get("pubmed_id", "")),
             "outcome_found": False,
             "outcome_type": "overall_survival",
             "source_used": source_used,
             "arms": [],
+            "plot_rows": [],
             "notes": f"No {source_used} text available."
         }
+        return empty_result
 
     prompt = f"""
 You are an expert biomedical information extraction assistant.
@@ -394,11 +502,12 @@ Important rules:
 2. If this is a single-arm study, return one arm only.
 3. If OS is reported for subgroups only, extract only if those subgroups are clearly the treatment arms of the study.
 4. If OS is not explicitly reported, set "outcome_found" to false and return an empty arms list.
-5. If the median OS is reported as "not reached", preserve exactly "not reached".
+5. If the median OS is reported as "not reached" or "NR", preserve that exactly in the raw field. For parsed numeric fields, use null when a bound is not numeric.
 6. Do not infer or calculate anything that is not explicitly stated in the text.
-7. Include the exact supporting sentence or phrase in "evidence".
-8. If arm names are not explicitly stated next to the OS result, use the clearest study-arm label supported by the text.
-9. Output JSON only. No markdown, no explanation.
+7. Preserve reported values faithfully. Do not convert years to months. Do not perform arithmetic.
+8. Include the exact supporting sentence or phrase in "evidence".
+9. If arm names are not explicitly stated next to the OS result, use the clearest study-arm label supported by the text.
+10. Output JSON only. No markdown, no explanation.
 
 Return ONLY JSON in exactly this format:
 {{
@@ -409,8 +518,13 @@ Return ONLY JSON in exactly this format:
   "arms": [
     {{
       "arm_name": "string",
-      "median_os": "string",
-      "ci_95": "string",
+      "median_os_raw": "string",
+      "median_os_value": "string or null",
+      "median_os_unit": "string or null",
+      "ci_95_raw": "string",
+      "ci_lower": "string or null",
+      "ci_upper": "string or null",
+      "ci_unit": "string or null",
       "evidence": "string"
     }}
   ],
@@ -463,8 +577,32 @@ Text:
         if "notes" not in result:
             result["notes"] = ""
 
-        return result
+        # normalize arm-level fields lightly
+        normalized_arms = []
+        for arm in result["arms"]:
+            normalized_arms.append({
+                "arm_name": arm.get("arm_name", "unknown arm"),
+                "median_os_raw": arm.get("median_os_raw"),
+                "median_os_value": arm.get("median_os_value"),
+                "median_os_unit": arm.get("median_os_unit"),
+                "ci_95_raw": arm.get("ci_95_raw"),
+                "ci_lower": arm.get("ci_lower"),
+                "ci_upper": arm.get("ci_upper"),
+                "ci_unit": arm.get("ci_unit"),
+                "evidence": arm.get("evidence", "")
+            })
 
+        result["arms"] = normalized_arms
+
+        # second-level return for question (d)
+        result["plot_rows"] = build_plot_rows_from_extraction(
+            result,
+            trial_id=trial_id,
+            trial_label=trial_label,
+        )
+
+        return result
+    
     except Exception:
         raise ValueError(
             "LLM did not return valid JSON for survival extraction:\n" + content
