@@ -6,19 +6,20 @@ import json
 
 
 
-def _select_trial_interactively(df_trials: pd.DataFrame, page_size: int = 10) -> int | None:
+def _select_trials_interactively(df_trials: pd.DataFrame, page_size: int = 10) -> list[int]:
     """
-    Let user browse candidate trials page by page and select one trial index.
+    Let user browse candidate trials page by page and select MULTIPLE trials.
 
     Returns
     -------
-    trial_idx : int | None
-        Global row index in df_trials, or None if user quits.
+    selected_trial_indices : list[int]
+        List of global row indices in df_trials.
     """
     cols = [c for c in ["nct_id", "brief_title", "start_date", "phases"] if c in df_trials.columns]
 
     total = len(df_trials)
     current_page = 0
+    selected_indices = set()
 
     while True:
         start = current_page * page_size
@@ -30,15 +31,20 @@ def _select_trial_interactively(df_trials: pd.DataFrame, page_size: int = 10) ->
         print(f"\n[Step 3] Candidate trials (showing {start}–{end - 1} of {total - 1})")
         print(display_df)
 
+        print("\nCurrently selected indices:", sorted(selected_indices) if selected_indices else "None")
+
         print("\nOptions:")
-        print("  [0-9]  Select a trial index on the current page")
-        print("  n      Next page")
-        print("  p      Previous page")
-        print("  g NUM  Jump to global index NUM (example: g 25)")
-        print("  q      Quit")
+        print("  [0-9]      Add trial index from current page")
+        print("  r NUM      Remove global index NUM (example: r 25)")
+        print("  g NUM      Add global index NUM (example: g 25)")
+        print("  n          Next page")
+        print("  p          Previous page")
+        print("  d          Done (finish selection)")
+        print("  q          Quit (return empty list)")
 
         choice = input("\nYour choice: ").strip().lower()
 
+        # ---------- navigation ----------
         if choice == "n":
             if end < total:
                 current_page += 1
@@ -53,30 +59,52 @@ def _select_trial_interactively(df_trials: pd.DataFrame, page_size: int = 10) ->
                 print("Already at the first page.")
             continue
 
-        if choice == "q":
-            return None
+        # ---------- finish ----------
+        if choice == "d":
+            return sorted(selected_indices)
 
+        if choice == "q":
+            return []
+
+        # ---------- add via global ----------
         if choice.startswith("g "):
             parts = choice.split()
             if len(parts) == 2 and parts[1].isdigit():
-                global_idx = int(parts[1])
-                if 0 <= global_idx < total:
-                    return global_idx
+                idx = int(parts[1])
+                if 0 <= idx < total:
+                    selected_indices.add(idx)
+                    print(f"Added trial {idx}")
                 else:
                     print("Global index out of range.")
             else:
-                print("Invalid jump command. Use format: g 25")
+                print("Invalid format. Use: g 25")
             continue
 
+        # ---------- remove ----------
+        if choice.startswith("r "):
+            parts = choice.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                idx = int(parts[1])
+                if idx in selected_indices:
+                    selected_indices.remove(idx)
+                    print(f"Removed trial {idx}")
+                else:
+                    print("Index not in selection.")
+            else:
+                print("Invalid format. Use: r 25")
+            continue
+
+        # ---------- add from page ----------
         try:
             idx_in_page = int(choice)
             if 0 <= idx_in_page < len(display_df):
-                trial_idx = start + idx_in_page
-                return trial_idx
+                global_idx = start + idx_in_page
+                selected_indices.add(global_idx)
+                print(f"Added trial {global_idx}")
             else:
-                print("Index out of range on the current page.")
+                print("Index out of range on current page.")
         except ValueError:
-            print("Invalid input. Please enter 0-9, n, p, g NUM, or q.")
+            print("Invalid input.")
 
 
 def run_agentic_app(user_input: str, mode: str = "hybrid", page_size: int = 10):
@@ -98,9 +126,9 @@ def run_agentic_app(user_input: str, mode: str = "hybrid", page_size: int = 10):
             "survival_result": None,
         }
 
-    selected_trial_idx = _select_trial_interactively(df_trials, page_size=page_size)
+    selected_trial_indices = _select_trials_interactively(df_trials, page_size=page_size)
 
-    if selected_trial_idx is None:
+    if selected_trial_indices is None:
         print("No trial selected. Exiting.")
         return {
             "query": structured_query,
@@ -110,44 +138,59 @@ def run_agentic_app(user_input: str, mode: str = "hybrid", page_size: int = 10):
             "survival_result": None,
         }
 
-    trial_row = df_trials.iloc[selected_trial_idx].to_dict()
+    per_trial_results = []
 
-    print(f"\n[Step 4] Linking selected trial #{selected_trial_idx} to PubMed papers with mode = {mode} ...")
-    print(f"Selected NCT ID: {trial_row.get('nct_id')}")
-    print(f"Selected trial title: {trial_row.get('brief_title')}")
+    for idx in selected_trial_indices:
+        trial_row = df_trials.iloc[idx].to_dict()
 
-    result = link_one_trial(
-        trial_row,
-        mode=mode,
-        use_llm=True,
-        max_papers_per_query=5,
-        verbose=True,
-    )
+        print(f"\n[Step 4] Linking selected trial #{idx} to PubMed papers with mode = {mode} ...")
+        print(f"Selected NCT ID: {trial_row.get('nct_id')}")
+        print(f"Selected trial title: {trial_row.get('brief_title')}")
 
-    print("\n[Step 5] Final link result:")
-    print(result["judge_result"])
-
-    print("\n[Step 6] Extracting median OS and 95% CI by treatment arm...")
-    survival_result = extract_survival_from_link_result(result)
-
-    print("\n=== Survival Extraction Result ===")
-    print(json.dumps(survival_result["survival_extraction"], indent=2, ensure_ascii=False))
-
-
-    # ✅ Step 7: draw forest plot (single trial)
-    plot_rows = survival_result["survival_extraction"].get("plot_rows", [])
-
-    if plot_rows:
-        print("\n[Step 7] Drawing forest plot for selected trial...")
-
-        trial_label = trial_row.get("brief_title")  
-
-        draw_single_trial_forest_plot(
-            plot_rows,
-            trial_label=trial_label
+        result = link_one_trial(
+            trial_row,
+            mode=mode,
+            use_llm=True,
+            max_papers_per_query=5,
+            verbose=True,
         )
-    else:
-        print("\n[Step 7] No plot data available.")
+
+        print("\n[Step 5] Final link result:")
+        print(result["judge_result"])
+
+        print("\n[Step 6] Extracting median OS and 95% CI by treatment arm...")
+        survival_result = extract_survival_from_link_result(result, trial_row=trial_row)
+
+        print("\n=== Survival Extraction Result ===")
+        print(json.dumps(survival_result["survival_extraction"], indent=2, ensure_ascii=False))
+
+        # Step 7: draw forest plot for this single selected trial
+        plot_rows = survival_result["survival_extraction"].get("plot_rows", [])
+
+        if plot_rows:
+            print("\n[Step 7] Drawing forest plot for selected trial...")
+
+            trial_label = trial_row.get("brief_title")
+
+            draw_single_trial_forest_plot(
+                plot_rows,
+                trial_label=trial_label
+            )
+        else:
+            print("\n[Step 7] No plot data available.")
+
+        per_trial_results.append({
+            "selected_trial_index": idx,
+            "trial_row": trial_row,
+            "link_result": result,
+            "survival_result": survival_result,
+        })
+    return {
+        "query": structured_query,
+        "trials": df_trials,
+        "selected_trial_indices": selected_trial_indices,
+        "per_trial_results": per_trial_results,
+    }
 
 if __name__ == "__main__":
     user_input = input("Enter your trial search request: ").strip()

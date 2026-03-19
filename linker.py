@@ -330,39 +330,105 @@ def link_one_trial(
     }
 
 
-def extract_survival_from_link_result(link_result: Dict[str, Any]) -> Dict[str, Any]:
+def extract_survival_from_link_result(
+    link_result: Dict[str, Any],
+    trial_row: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Use selected PubMed paper from link_result and extract median OS by arm.
+    Always returns a non-None survival_extraction dict.
     """
+
     judge_result = link_result.get("judge_result", {})
     pubmed_id = judge_result.get("selected_pubmed_id")
 
+    trial_id = None
+    trial_label = None
+    if trial_row is not None:
+        trial_id = trial_row.get("nct_id")
+        trial_label = trial_row.get("brief_title")
+
+    empty_extraction = {
+        "paper_id": pubmed_id,
+        "outcome_found": False,
+        "outcome_type": "overall_survival",
+        "source_used": "abstract",
+        "arms": [],
+        "plot_rows": [],
+        "notes": "",
+    }
+
     if not pubmed_id:
+        empty_extraction["notes"] = "No selected_pubmed_id found in link_result['judge_result']."
         return {
             "status": "error",
             "message": "No selected_pubmed_id found in link_result['judge_result']",
             "pubmed_record": None,
-            "survival_extraction": None,
+            "survival_extraction": empty_extraction,
         }
 
-    pubmed_record = fetch_pubmed_abstract(pubmed_id)
+    try:
+        pubmed_record = fetch_pubmed_abstract(pubmed_id)
+    except Exception as e:
+        empty_extraction["paper_id"] = pubmed_id
+        empty_extraction["notes"] = f"Failed to fetch PubMed abstract: {str(e)}"
+        return {
+            "status": "error",
+            "message": f"Failed to fetch PubMed abstract for PMID={pubmed_id}",
+            "pubmed_record": None,
+            "survival_extraction": empty_extraction,
+        }
 
     if not pubmed_record.get("abstract"):
+        empty_extraction["paper_id"] = pubmed_id
+        empty_extraction["notes"] = "No abstract available from PubMed."
         return {
             "status": "warning",
             "message": f"Abstract not found for PMID={pubmed_id}",
             "pubmed_record": pubmed_record,
-            "survival_extraction": {
-                "paper_id": pubmed_id,
-                "outcome_found": False,
-                "outcome_type": "overall_survival",
-                "source_used": "abstract",
-                "arms": [],
-                "notes": "No abstract available from PubMed.",
-            },
+            "survival_extraction": empty_extraction,
         }
 
-    extraction = llm_extract_survival_from_text(pubmed_record)
+    try:
+        extraction = llm_extract_survival_from_text(
+            pubmed_record,
+            trial_id=trial_id,
+            trial_label=trial_label,
+        )
+    except Exception as e:
+        empty_extraction["paper_id"] = pubmed_id
+        empty_extraction["notes"] = f"LLM extraction failed: {str(e)}"
+        return {
+            "status": "error",
+            "message": f"LLM extraction failed for PMID={pubmed_id}",
+            "pubmed_record": pubmed_record,
+            "survival_extraction": empty_extraction,
+        }
+
+    if extraction is None:
+        empty_extraction["paper_id"] = pubmed_id
+        empty_extraction["notes"] = "LLM returned None."
+        return {
+            "status": "warning",
+            "message": f"LLM returned None for PMID={pubmed_id}",
+            "pubmed_record": pubmed_record,
+            "survival_extraction": empty_extraction,
+        }
+
+    if "paper_id" not in extraction:
+        extraction["paper_id"] = pubmed_id
+    if "outcome_found" not in extraction:
+        extraction["outcome_found"] = False
+    if "outcome_type" not in extraction:
+        extraction["outcome_type"] = "overall_survival"
+    if "source_used" not in extraction:
+        extraction["source_used"] = "abstract"
+    if "arms" not in extraction or extraction["arms"] is None:
+        extraction["arms"] = []
+    if "plot_rows" not in extraction or extraction["plot_rows"] is None:
+        extraction["plot_rows"] = []
+    if "notes" not in extraction:
+        extraction["notes"] = ""
 
     return {
         "status": "ok",
