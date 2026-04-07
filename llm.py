@@ -2,7 +2,28 @@ from openai import OpenAI
 from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, MODEL_NAME, RERANK_TOP_K
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import requests
+import xml.etree.ElementTree as ET
+import os
+import fitz  
+
+def read_pdf_text(pdf_path: str) -> str:
+    if not pdf_path or not os.path.exists(pdf_path):
+        return ""
+
+    text_chunks = []
+    doc = fitz.open(pdf_path)
+    try:
+        for page in doc:
+            txt = page.get_text("text")
+            if txt:
+                text_chunks.append(txt)
+    finally:
+        doc.close()
+
+    return "\n\n".join(text_chunks).strip()
+
 
 client = OpenAI(
     api_key=OPENROUTER_API_KEY,
@@ -31,66 +52,6 @@ Abstract: {p.get('abstract')}
     return context
 
 
-def rerank_papers(query, papers, top_k=RERANK_TOP_K):
-    """
-    Use LLM to rerank papers by relevance to the user query.
-    Return the selected top_k papers.
-    """
-    if len(papers) <= top_k:
-        return papers
-
-    context = _build_paper_context(papers)
-
-    prompt = f"""
-User query: {query}
-
-Below are {len(papers)} candidate PubMed papers:
-
-{context}
-
-Select the {top_k} most relevant papers for the user query.
-
-Return ONLY a comma-separated list of paper numbers, for example:
-1,3,5,7,8,10
-
-Do not explain anything.
-"""
-
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "You are a biomedical literature relevance judge."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-
-    text = response.choices[0].message.content.strip()
-
-    try:
-        selected_indices = []
-        for x in text.split(","):
-            x = x.strip()
-            if x.isdigit():
-                idx = int(x)
-                if 1 <= idx <= len(papers):
-                    selected_indices.append(idx - 1)
-
-        seen = set()
-        selected_indices = [i for i in selected_indices if not (i in seen or seen.add(i))]
-
-        selected_papers = [papers[i] for i in selected_indices[:top_k]]
-        
-        if len(selected_papers) < top_k:
-            for p in papers:
-                if p not in selected_papers:
-                    selected_papers.append(p)
-                if len(selected_papers) == top_k:
-                    break
-
-        return selected_papers
-
-    except Exception:
-        return papers[:top_k]
 
 
 def summarize_papers(query, papers, stats):
@@ -128,6 +89,7 @@ Please do the following:
     return response.choices[0].message.content
 
 
+# code to convert user input to structured trial search request, clinical trials agent.
 def llm_parse_query(user_input: str) -> dict:
     """
     Use LLM to convert natural language into structured query
@@ -190,6 +152,39 @@ def _clean_llm_json(content: str) -> str:
     return content.strip()
 
 
+
+def _to_float_or_none(x):
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "":
+        return None
+    if s.lower() in {"nr", "not reached", "na", "n/a", "none", "null"}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _normalize_unit(unit: Optional[str]) -> Optional[str]:
+    if unit is None:
+        return None
+    u = str(unit).strip().lower()
+    if u in {"month", "months", "mo", "mos"}:
+        return "months"
+    if u in {"year", "years", "yr", "yrs"}:
+        return "years"
+    return u if u else None
+
+
+
+
+
+
+
+
+
+# generate semantic information for retriving papers(case B)
 def llm_extract_trial_semantic_terms(fields: dict) -> dict:
     """
     Use LLM to extract trial-specific semantic retrieval terms.
@@ -248,6 +243,67 @@ Return JSON with keys:
         raise ValueError("LLM did not return valid JSON for trial semantic terms:\n" + content)
     
 
+
+# def rerank_papers(query, papers, top_k=RERANK_TOP_K):
+#     """
+#     Use LLM to rerank papers by relevance to the user query.
+#     Return the selected top_k papers.
+#     """
+#     if len(papers) <= top_k:
+#         return papers
+
+#     context = _build_paper_context(papers)
+
+#     prompt = f"""
+# User query: {query}
+
+# Below are {len(papers)} candidate PubMed papers:
+
+# {context}
+
+# Select the {top_k} most relevant papers for the user query.
+
+# Return ONLY a comma-separated list of paper numbers, for example:
+# 1,3,5,7,8,10
+
+# Do not explain anything.
+# """
+
+#     response = client.chat.completions.create(
+#         model=MODEL_NAME,
+#         messages=[
+#             {"role": "system", "content": "You are a biomedical literature relevance judge."},
+#             {"role": "user", "content": prompt}
+#         ]
+#     )
+
+#     text = response.choices[0].message.content.strip()
+
+#     try:
+#         selected_indices = []
+#         for x in text.split(","):
+#             x = x.strip()
+#             if x.isdigit():
+#                 idx = int(x)
+#                 if 1 <= idx <= len(papers):
+#                     selected_indices.append(idx - 1)
+
+#         seen = set()
+#         selected_indices = [i for i in selected_indices if not (i in seen or seen.add(i))]
+
+#         selected_papers = [papers[i] for i in selected_indices[:top_k]]
+        
+#         if len(selected_papers) < top_k:
+#             for p in papers:
+#                 if p not in selected_papers:
+#                     selected_papers.append(p)
+#                 if len(selected_papers) == top_k:
+#                     break
+
+#         return selected_papers
+
+#     except Exception:
+#         return papers[:top_k]
 
 # code for llm to judge the papers retrived by a,b,c mode.
 def llm_judge_trial_papers(trial_fields: dict, candidate_papers: list) -> dict:
@@ -338,149 +394,282 @@ Return ONLY JSON in this format:
         raise ValueError("LLM did not return valid JSON for trial-paper judge:\n" + content)
     
 
+NCBI_IDCONV_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+NCBI_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-def _to_float_or_none(x):
-    if x is None:
+
+def get_pmcid_from_pmid(pmid: str, email: Optional[str] = None) -> Optional[str]:
+    """
+    Convert PMID -> PMCID using NCBI idconv API.
+    Returns PMCID like 'PMC1234567' if available, else None.
+    """
+    if not pmid:
         return None
-    s = str(x).strip()
-    if s == "":
-        return None
-    if s.lower() in {"nr", "not reached", "na", "n/a", "none", "null"}:
-        return None
+
+    params = {
+        "tool": "pubmed-survival-agent",
+        "format": "json",
+        "ids": str(pmid),
+    }
+    if email:
+        params["email"] = email
+
     try:
-        return float(s)
+        resp = requests.get(NCBI_IDCONV_URL, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        records = data.get("records", [])
+        if not records:
+            return None
+
+        pmcid = records[0].get("pmcid")
+        return pmcid if pmcid else None
+
     except Exception:
         return None
 
-def _normalize_unit(unit: Optional[str]) -> Optional[str]:
-    if unit is None:
+
+def fetch_pmc_full_text_xml(pmcid: str, email: Optional[str] = None) -> Optional[str]:
+    """
+    Fetch PMC full text in XML via EFetch.
+    pmcid can be 'PMC1234567' or numeric part; EFetch db=pmc works with numeric id.
+    """
+    if not pmcid:
         return None
-    u = str(unit).strip().lower()
-    if u in {"month", "months", "mo", "mos"}:
-        return "months"
-    if u in {"year", "years", "yr", "yrs"}:
-        return "years"
-    return u if u else None
 
-def build_plot_rows_from_extraction(
-    extraction_result: Dict[str, Any],
-    trial_id: Optional[str] = None,
-    trial_label: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    pmc_numeric = str(pmcid).replace("PMC", "").strip()
+
+    params = {
+        "db": "pmc",
+        "id": pmc_numeric,
+        "retmode": "xml",
+        "tool": "pubmed-survival-agent",
+    }
+    if email:
+        params["email"] = email
+
+    try:
+        resp = requests.get(NCBI_EFETCH_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        xml_text = resp.text.strip()
+        return xml_text if xml_text else None
+    except Exception:
+        return None
+
+
+def _safe_join_text(elements) -> str:
+    chunks = []
+    for el in elements:
+        txt = " ".join(el.itertext()).strip()
+        if txt:
+            chunks.append(txt)
+    return "\n\n".join(chunks)
+
+
+def parse_pmc_xml_to_text(xml_text: str) -> str:
     """
-    Convert extraction-rich result into plot-ready rows (NO unit conversion).
-
-    Each returned row corresponds to one treatment arm.
-    Units are preserved exactly as extracted.
+    Parse PMC XML and return a reasonably clean full-text string.
+    Prefer abstract + body.
     """
-    rows: List[Dict[str, Any]] = []
+    if not xml_text or not xml_text.strip():
+        return ""
 
-    if not extraction_result.get("outcome_found", False):
-        return rows
+    try:
+        root = ET.fromstring(xml_text)
 
-    paper_id = extraction_result.get("paper_id")
-    source_used = extraction_result.get("source_used")
-    arms = extraction_result.get("arms", [])
+        abstract_nodes = root.findall(".//abstract")
+        body_nodes = root.findall(".//body")
 
-    for arm in arms:
-        arm_name = arm.get("arm_name", "unknown arm")
+        abstract_text = _safe_join_text(abstract_nodes)
+        body_text = _safe_join_text(body_nodes)
 
-        median_os_value = _to_float_or_none(arm.get("median_os_value"))
-        median_os_unit = _normalize_unit(arm.get("median_os_unit"))
+        combined = "\n\n".join(
+            x for x in [abstract_text, body_text] if x and x.strip()
+        ).strip()
 
-        ci_lower = _to_float_or_none(arm.get("ci_lower"))
-        ci_upper = _to_float_or_none(arm.get("ci_upper"))
-        ci_unit = _normalize_unit(arm.get("ci_unit")) or median_os_unit
+        return combined
 
-        plot_eligible = median_os_value is not None
+    except Exception:
+        return ""
 
-        rows.append({
-            "trial_id": trial_id,
-            "trial_label": trial_label,
-            "paper_id": paper_id,
+
+def get_best_text_for_extraction(
+    pubmed_record: Dict[str, Any],
+    email: Optional[str] = None,
+) -> Tuple[str, str, Optional[str]]:
+    """
+    PMC + fallback:
+    1. Try PMID -> PMCID
+    2. If PMCID exists, fetch PMC full text XML and parse it
+    3. Else fallback to abstract
+
+    Returns:
+        source_text, source_used, pmcid
+    where source_used is one of:
+        'pmc_full_text', 'abstract', 'none'
+    """
+    pmid = str(pubmed_record.get("pubmed_id", "")).strip()
+    abstract = str(pubmed_record.get("abstract", "") or "").strip()
+
+    pmcid = get_pmcid_from_pmid(pmid, email=email)
+    if pmcid:
+        xml_text = fetch_pmc_full_text_xml(pmcid, email=email)
+        full_text = parse_pmc_xml_to_text(xml_text) if xml_text else ""
+
+        if full_text.strip():
+            return full_text, "pmc_full_text", pmcid
+
+    if abstract:
+        return abstract, "abstract", pmcid
+
+    return "", "none", pmcid
+
+def llm_judge_survival_plot_eligibility(
+    pubmed_record: Dict[str, Any],
+    full_text: Optional[str] = None,
+    email: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Ask LLM whether this paper is suitable for arm-level survival extraction
+    for forest-plot style summarization.
+    """
+
+    # 和 extraction 一样，先决定看什么文本
+    if full_text and str(full_text).strip():
+        source_text = full_text
+        source_used = "user_pdf"
+        pmcid = None
+    else:
+        source_text, source_used, pmcid = get_best_text_for_extraction(
+            pubmed_record,
+            email=email,
+        )
+
+    if not source_text or not str(source_text).strip():
+        return {
+            "eligible": False,
+            "reason": "No usable text available.",
+            "paper_type": "unknown",
             "source_used": source_used,
+            "pmcid": pmcid,
+        }
 
-            "arm_name": arm_name,
-            "display_label": f"{trial_label} | {arm_name}" if trial_label else arm_name,
+    prompt = f"""
+You are an expert biomedical trial-reading assistant.
 
-            "median_os_raw": arm.get("median_os_raw"),
-            "ci_95_raw": arm.get("ci_95_raw"),
-            "median_os_value": median_os_value,
-            "median_os_unit": median_os_unit,
-            "ci_lower": ci_lower,
-            "ci_upper": ci_upper,
-            "ci_unit": ci_unit,
+Task:
+Determine whether this paper is appropriate for ARM-LEVEL overall survival extraction
+for a forest-plot style summary across trials.
 
-            # metadata
-            "plot_eligible": plot_eligible,
-            "evidence": arm.get("evidence", "")
-        })
+The paper is ELIGIBLE only if it primarily reports study-level or treatment-arm-level
+overall survival outcomes (for example median OS by arm, with or without CI).
 
-    return rows
+The paper is NOT ELIGIBLE if it is mainly:
+- a case report
+- a case series
+- patient-by-patient narrative reporting
+- a review, commentary, or non-original trial report
+- a biomarker/correlative paper without treatment-arm-level survival extraction target
+- a paper that reports only individual patient outcomes rather than arm-level trial outcomes
 
+Return JSON only in this format:
+{{
+  "eligible": true,
+  "paper_type": "trial_report | case_series | case_report | biomarker_study | review | unknown",
+  "reason": "short explanation"
+}}
+
+Paper metadata:
+- PubMed ID: {pubmed_record.get("pubmed_id", "")}
+- Title: {pubmed_record.get("title", "")}
+- Journal: {pubmed_record.get("journal", "")}
+- Year: {pubmed_record.get("year", "")}
+- PMCID: {pmcid or ""}
+
+Text:
+\"\"\"
+{source_text[:12000]}
+\"\"\"
+""".strip()
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a precise biomedical paper triage assistant."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0
+    )
+
+    content = response.choices[0].message.content.strip()
+    content = _clean_llm_json(content)
+
+    try:
+        result = json.loads(content)
+    except Exception:
+        result = {
+            "eligible": True,   # conservative fallback: don't block extraction if JSON parsing fails
+            "paper_type": "unknown",
+            "reason": "Eligibility JSON parse failed; defaulting to extraction."
+        }
+
+    result["source_used"] = source_used
+    result["pmcid"] = pmcid
+    return result
 
 def llm_extract_survival_from_text(
     pubmed_record: Dict[str, Any],
     full_text: Optional[str] = None,
     trial_id: Optional[str] = None,
     trial_label: Optional[str] = None,
+    email: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Use LLM to extract median overall survival (OS) and 95% CI by treatment arm
-    from abstract or full text.
+    Use LLM to extract median overall survival (OS), 95% CI, and sample size by treatment arm.
 
-    Returns a dict with two levels:
-    1. arms       -> extraction-rich structure for question (c)
-    2. plot_rows  -> normalized rows for forest plot preparation in (d)
-
-    Return example:
-    {
-        "paper_id": "32199466",
-        "outcome_found": true,
-        "outcome_type": "overall_survival",
-        "source_used": "abstract",
-        "arms": [
-            {
-                "arm_name": "Pembrolizumab",
-                "median_os_raw": "9.8 months",
-                "median_os_value": "9.8",
-                "median_os_unit": "months",
-                "ci_95_raw": "7.1 to 14.6",
-                "ci_lower": "7.1",
-                "ci_upper": "14.6",
-                "ci_unit": "months",
-                "evidence": "Median overall survival was 9.8 months (95% CI 7.1-14.6)."
-            }
-        ],
-        "plot_rows": [
-            {
-                "trial_id": "NCTxxxx",
-                "trial_label": "PePS2",
-                "paper_id": "32199466",
-                "arm_name": "Pembrolizumab",
-                "display_label": "PePS2 | Pembrolizumab",
-                "median_os_months": 9.8,
-                "ci_lower_months": 7.1,
-                "ci_upper_months": 14.6,
-                "plot_eligible": true,
-                "evidence": "..."
-            }
-        ],
-        "notes": "single-arm trial"
-    }
+    Retrieval strategy:
+    1. If full_text is explicitly provided, use it.
+    2. Else try PMC full text from PMID.
+    3. If PMC full text is unavailable, fallback to abstract.
     """
-    source_text = full_text if full_text else pubmed_record.get("abstract", "")
-    source_used = "full_text" if full_text else "abstract"
+
+    # Priority 1: externally provided full text
+    if full_text and str(full_text).strip():
+        source_text = full_text
+        source_used = "full_text"
+        pmcid = None
+    else:
+        source_text, source_used, pmcid = get_best_text_for_extraction(
+            pubmed_record,
+            email=email,
+        )
+
+    # ===== Agent logging: retrieval step =====
+    print("[Step] Retrieving text for extraction...")
+
+    print(f"  PMID: {pubmed_record.get('pubmed_id')}")
+    print(f"  Source used: {source_used}")
+
+    if pmcid:
+        print(f"  PMCID: {pmcid}")
 
     if not source_text or not str(source_text).strip():
         empty_result = {
             "paper_id": str(pubmed_record.get("pubmed_id", "")),
+            "pmcid": pmcid,
             "outcome_found": False,
             "outcome_type": "overall_survival",
             "source_used": source_used,
             "arms": [],
             "plot_rows": [],
-            "notes": f"No {source_used} text available."
+            "notes": f"No usable text available. source_used={source_used}"
         }
         return empty_result
 
@@ -489,13 +678,14 @@ You are an expert biomedical information extraction assistant.
 
 Paper metadata:
 - PubMed ID: {pubmed_record.get("pubmed_id", "")}
+- PMCID: {pmcid or ""}
 - Title: {pubmed_record.get("title", "")}
 - Journal: {pubmed_record.get("journal", "")}
 - Year: {pubmed_record.get("year", "")}
 
 Task:
-Extract the median OVERALL SURVIVAL (OS) and its 95% confidence interval (CI) by treatment arm
-from the text below.
+Extract the median OVERALL SURVIVAL (OS), its 95% confidence interval (CI),
+and the sample size for each treatment arm from the text below.
 
 Important rules:
 1. Extract ONLY OVERALL SURVIVAL (OS), not progression-free survival (PFS), disease-free survival (DFS), duration of response (DOR), overall response rate (ORR), or other endpoints.
@@ -507,7 +697,9 @@ Important rules:
 7. Preserve reported values faithfully. Do not convert years to months. Do not perform arithmetic.
 8. Include the exact supporting sentence or phrase in "evidence".
 9. If arm names are not explicitly stated next to the OS result, use the clearest study-arm label supported by the text.
-10. Output JSON only. No markdown, no explanation.
+10. Extract arm-level sample size only when explicitly stated or clearly attributable to that arm.
+11. If only total study sample size is given and cannot be assigned to a specific arm, set arm_sample_size to null and mention that in notes.
+12. Output JSON only. No markdown, no explanation.
 
 Return ONLY JSON in exactly this format:
 {{
@@ -518,6 +710,8 @@ Return ONLY JSON in exactly this format:
   "arms": [
     {{
       "arm_name": "string",
+      "arm_sample_size_raw": "string or null",
+      "arm_sample_size": "string or null",
       "median_os_raw": "string",
       "median_os_value": "string or null",
       "median_os_unit": "string or null",
@@ -558,9 +752,10 @@ Text:
     try:
         result = json.loads(content)
 
-        # minimal normalization / sanity checks
         if "paper_id" not in result:
             result["paper_id"] = str(pubmed_record.get("pubmed_id", ""))
+
+        result["pmcid"] = pmcid
 
         if "outcome_found" not in result:
             result["outcome_found"] = False
@@ -577,11 +772,23 @@ Text:
         if "notes" not in result:
             result["notes"] = ""
 
-        # normalize arm-level fields lightly
         normalized_arms = []
         for arm in result["arms"]:
+            arm_sample_size = arm.get("arm_sample_size")
+
+            if arm_sample_size in ["", "null", "None"]:
+                arm_sample_size = None
+
+            try:
+                if arm_sample_size is not None:
+                    arm_sample_size = int(float(arm_sample_size))
+            except Exception:
+                arm_sample_size = None
+
             normalized_arms.append({
                 "arm_name": arm.get("arm_name", "unknown arm"),
+                "arm_sample_size_raw": arm.get("arm_sample_size_raw"),
+                "arm_sample_size": arm_sample_size,
                 "median_os_raw": arm.get("median_os_raw"),
                 "median_os_value": arm.get("median_os_value"),
                 "median_os_unit": arm.get("median_os_unit"),
@@ -594,7 +801,6 @@ Text:
 
         result["arms"] = normalized_arms
 
-        # second-level return for question (d)
         result["plot_rows"] = build_plot_rows_from_extraction(
             result,
             trial_id=trial_id,
@@ -602,8 +808,81 @@ Text:
         )
 
         return result
-    
+
     except Exception:
         raise ValueError(
             "LLM did not return valid JSON for survival extraction:\n" + content
         )
+
+
+def build_plot_rows_from_extraction(
+    extraction_result: Dict[str, Any],
+    trial_id: Optional[str] = None,
+    trial_label: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Convert extraction-rich result into plot-ready rows (NO unit conversion).
+
+    Each returned row corresponds to one treatment arm.
+    Units are preserved exactly as extracted.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    if not extraction_result.get("outcome_found", False):
+        return rows
+
+    paper_id = extraction_result.get("paper_id")
+    source_used = extraction_result.get("source_used")
+    arms = extraction_result.get("arms", [])
+
+    for arm in arms:
+        arm_name = arm.get("arm_name", "unknown arm")
+
+        median_os_value = _to_float_or_none(arm.get("median_os_value"))
+        median_os_unit = _normalize_unit(arm.get("median_os_unit"))
+
+        ci_lower = _to_float_or_none(arm.get("ci_lower"))
+        ci_upper = _to_float_or_none(arm.get("ci_upper"))
+        ci_unit = _normalize_unit(arm.get("ci_unit")) or median_os_unit
+
+        # sample size
+        arm_sample_size = arm.get("arm_sample_size")
+        try:
+            if arm_sample_size not in [None, "", "null", "None"]:
+                arm_sample_size = int(float(arm_sample_size))
+            else:
+                arm_sample_size = None
+        except Exception:
+            arm_sample_size = None
+
+        plot_eligible = median_os_value is not None
+
+        rows.append({
+            "trial_id": trial_id,
+            "trial_label": trial_label,
+            "paper_id": paper_id,
+            "source_used": source_used,
+
+            "arm_name": arm_name,
+            "display_label": f"{trial_label} | {arm_name}" if trial_label else arm_name,
+
+            "median_os_raw": arm.get("median_os_raw"),
+            "ci_95_raw": arm.get("ci_95_raw"),
+            "median_os_value": median_os_value,
+            "median_os_unit": median_os_unit,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "ci_unit": ci_unit,
+
+            # sample size
+            "sample_size": arm_sample_size,
+            "arm_sample_size": arm_sample_size,
+            "arm_sample_size_raw": arm.get("arm_sample_size_raw"),
+
+            # metadata
+            "plot_eligible": plot_eligible,
+            "evidence": arm.get("evidence", "")
+        })
+
+    return rows
+

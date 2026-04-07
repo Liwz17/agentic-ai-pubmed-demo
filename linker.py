@@ -1,7 +1,7 @@
 from typing import Dict, Any, List, Optional
 import pandas as pd
 from tools import query_pubmed
-from llm import rerank_papers, llm_extract_trial_semantic_terms, llm_judge_trial_papers, llm_extract_survival_from_text
+from llm import llm_extract_trial_semantic_terms, llm_judge_trial_papers, llm_extract_survival_from_text, read_pdf_text, llm_judge_survival_plot_eligibility
 import re
 from tools import (
     extract_trial_retrieval_fields,
@@ -152,75 +152,75 @@ def find_pubmed_candidates_for_trial(trial_row: pd.Series, max_papers_per_query:
     return candidates
 
 
-def link_one_trial_to_pubmed(trial_row: pd.Series, top_k_rerank: int = 5) -> Dict[str, Any]:
-    candidates = find_pubmed_candidates_for_trial(trial_row)
+# def link_one_trial_to_pubmed(trial_row: pd.Series, top_k_rerank: int = 5) -> Dict[str, Any]:
+#     candidates = find_pubmed_candidates_for_trial(trial_row)
 
-    if not candidates:
-        return {
-            "nct_id": trial_row.get("nct_id"),
-            "matched_pmid": None,
-            "matched_title": None,
-            "match_status": "no_candidate",
-            "match_confidence": "low",
-            "match_reason": "No PubMed candidates found",
-            "n_candidates": 0,
-        }
+#     if not candidates:
+#         return {
+#             "nct_id": trial_row.get("nct_id"),
+#             "matched_pmid": None,
+#             "matched_title": None,
+#             "match_status": "no_candidate",
+#             "match_confidence": "low",
+#             "match_reason": "No PubMed candidates found",
+#             "n_candidates": 0,
+#         }
 
-    scored = []
-    for p in candidates:
-        s = _score_trial_paper_match(trial_row, p)
-        scored.append({
-            **p,
-            **s
-        })
+#     scored = []
+#     for p in candidates:
+#         s = _score_trial_paper_match(trial_row, p)
+#         scored.append({
+#             **p,
+#             **s
+#         })
 
-    scored = sorted(scored, key=lambda x: x["rule_score"], reverse=True)
+#     scored = sorted(scored, key=lambda x: x["rule_score"], reverse=True)
 
-    top_candidates = scored[:10]
-    reranked = rerank_papers(
-        query=f"Find the paper most likely reporting results for trial {trial_row.get('nct_id')} {trial_row.get('brief_title')}",
-        papers=top_candidates,
-        top_k=min(top_k_rerank, len(top_candidates))
-    )
+#     top_candidates = scored[:10]
+#     reranked = rerank_papers(
+#         query=f"Find the paper most likely reporting results for trial {trial_row.get('nct_id')} {trial_row.get('brief_title')}",
+#         papers=top_candidates,
+#         top_k=min(top_k_rerank, len(top_candidates))
+#     )
 
-    best = reranked[0] if reranked else top_candidates[0]
+#     best = reranked[0] if reranked else top_candidates[0]
 
-    best_score = best.get("rule_score", 0)
-    if best_score >= 10:
-        status = "matched"
-        confidence = "high"
-    elif best_score >= 5:
-        status = "possible_match"
-        confidence = "medium"
-    else:
-        status = "weak_match"
-        confidence = "low"
+#     best_score = best.get("rule_score", 0)
+#     if best_score >= 10:
+#         status = "matched"
+#         confidence = "high"
+#     elif best_score >= 5:
+#         status = "possible_match"
+#         confidence = "medium"
+#     else:
+#         status = "weak_match"
+#         confidence = "low"
 
-    return {
-        "nct_id": trial_row.get("nct_id"),
-        "brief_title": trial_row.get("brief_title"),
-        "matched_pmid": best.get("pubmed_id"),
-        "matched_title": best.get("title"),
-        "match_status": status,
-        "match_confidence": confidence,
-        "match_reason": "; ".join(best.get("rule_reasons", [])),
-        "rule_score": best.get("rule_score"),
-        "n_candidates": len(candidates),
-    }
+#     return {
+#         "nct_id": trial_row.get("nct_id"),
+#         "brief_title": trial_row.get("brief_title"),
+#         "matched_pmid": best.get("pubmed_id"),
+#         "matched_title": best.get("title"),
+#         "match_status": status,
+#         "match_confidence": confidence,
+#         "match_reason": "; ".join(best.get("rule_reasons", [])),
+#         "rule_score": best.get("rule_score"),
+#         "n_candidates": len(candidates),
+#     }
 
 
-def link_trials_to_pubmed(df_trials: pd.DataFrame, limit: Optional[int] = None) -> pd.DataFrame:
-    if limit is not None:
-        df_trials = df_trials.head(limit).copy()
+# def link_trials_to_pubmed(df_trials: pd.DataFrame, limit: Optional[int] = None) -> pd.DataFrame:
+#     if limit is not None:
+#         df_trials = df_trials.head(limit).copy()
 
-    rows = []
-    for _, trial_row in df_trials.iterrows():
-        result = link_one_trial_to_pubmed(trial_row)
-        rows.append(result)
+#     rows = []
+#     for _, trial_row in df_trials.iterrows():
+#         result = link_one_trial_to_pubmed(trial_row)
+#         rows.append(result)
 
-    return pd.DataFrame(rows)
+#     return pd.DataFrame(rows)
 
-def _dedup_papers_by_pmid(papers: list) -> list:
+def dedup_papers_by_pmid(papers: list) -> list:
     seen = set()
     unique = []
 
@@ -295,7 +295,7 @@ def link_one_trial(
             print(query_C)
         papers_C = _run_pubmed_query_once(query_C, max_papers=max_papers_per_query)
 
-    all_candidates = _dedup_papers_by_pmid(papers_A + papers_B + papers_C)
+    all_candidates = dedup_papers_by_pmid(papers_A + papers_B + papers_C)
 
     if verbose:
         print(f"\nMode: {mode}")
@@ -333,13 +333,19 @@ def link_one_trial(
 def extract_survival_from_link_result(
     link_result: Dict[str, Any],
     trial_row: Optional[Dict[str, Any]] = None,
+    allow_user_pdf: bool = True,
 ) -> Dict[str, Any]:
     """
     Use selected PubMed paper from link_result and extract median OS by arm.
-    Always returns a non-None survival_extraction dict.
+
+    Flow:
+    1. Fetch PubMed record
+    2. First-pass extraction: PMC full text if available, else abstract
+    3. If only abstract was used and extraction is insufficient, optionally ask user for PDF
+    4. Re-run extraction with user-provided PDF text
     """
 
-    judge_result = link_result.get("judge_result", {})
+    judge_result = link_result.get("judge_result", {}) or {}
     pubmed_id = judge_result.get("selected_pubmed_id")
 
     trial_id = None
@@ -379,16 +385,33 @@ def extract_survival_from_link_result(
             "survival_extraction": empty_extraction,
         }
 
-    if not pubmed_record.get("abstract"):
+    # ------- LLM eligibility screening -------
+    try:
+        eligibility = llm_judge_survival_plot_eligibility(pubmed_record)
+    except Exception as e:
+        eligibility = {
+            "eligible": True,
+            "paper_type": "unknown",
+            "reason": f"Eligibility screening failed: {str(e)}"
+        }
+
+    if not eligibility.get("eligible", True):
         empty_extraction["paper_id"] = pubmed_id
-        empty_extraction["notes"] = "No abstract available from PubMed."
+        empty_extraction["source_used"] = eligibility.get("source_used", "abstract")
+        empty_extraction["notes"] = (
+            f"Skipped extraction because paper judged not eligible. "
+            f"paper_type={eligibility.get('paper_type')}; "
+            f"reason={eligibility.get('reason')}"
+        )
         return {
-            "status": "warning",
-            "message": f"Abstract not found for PMID={pubmed_id}",
+            "status": "skipped",
+            "message": "Paper judged not eligible for arm-level survival extraction.",
             "pubmed_record": pubmed_record,
+            "eligibility_judgment": eligibility,
             "survival_extraction": empty_extraction,
         }
 
+    # ------- Actual extraction -------
     try:
         extraction = llm_extract_survival_from_text(
             pubmed_record,
@@ -415,6 +438,62 @@ def extract_survival_from_link_result(
             "survival_extraction": empty_extraction,
         }
 
+    # ------- 用户 PDF fallback -------
+    needs_pdf_retry = (
+        allow_user_pdf
+        and extraction.get("source_used") == "abstract"
+    )
+
+    if needs_pdf_retry:
+        print("\n[Action] PMC full text unavailable, so extraction is currently based on abstract only.")
+        print(f"  PMID: {pubmed_id}")
+        print(f"  Title: {pubmed_record.get('title', '')}")
+
+        user_choice = input(
+            "Would you like to provide a local PDF for a second-pass extraction? [y/N]: "
+        ).strip().lower()
+
+        if user_choice in {"y", "yes"}:
+            pdf_path = input(
+                "Enter local PDF path, or press Enter to keep the abstract-based result: "
+            ).strip()
+
+            if pdf_path:
+                pdf_text = read_pdf_text(pdf_path)
+
+                if pdf_text:
+                    print("[Step] Re-running extraction using user-provided PDF...")
+
+                    try:
+                        extraction = llm_extract_survival_from_text(
+                            pubmed_record,
+                            full_text=pdf_text,
+                            trial_id=trial_id,
+                            trial_label=trial_label,
+                        )
+                        extraction["user_pdf_path"] = pdf_path
+                    except Exception as e:
+                        extraction["notes"] = (
+                            extraction.get("notes", "") +
+                            f" | User PDF retry failed: {str(e)}"
+                        )
+                else:
+                    extraction["notes"] = (
+                        extraction.get("notes", "") +
+                        " | User provided PDF path but no readable text was extracted. Kept abstract-based extraction."
+                    )
+            else:
+                extraction["notes"] = (
+                    extraction.get("notes", "") +
+                    " | User chose PDF retry but did not provide a path. Kept abstract-based extraction."
+                )
+        else:
+            extraction["notes"] = (
+                extraction.get("notes", "") +
+                " | User skipped PDF upload. Kept abstract-based extraction."
+            )
+
+    # ------- 标准化兜底 -------
     if "paper_id" not in extraction:
         extraction["paper_id"] = pubmed_id
     if "outcome_found" not in extraction:

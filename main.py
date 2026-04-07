@@ -1,48 +1,59 @@
-from agent import DemoAgent
+from llm import llm_parse_query
+from tools import search_clinical_trials, draw_single_trial_forest_plot, draw_multi_trial_forest_plot, select_trials_interactively
+from linker import link_one_trial, extract_survival_from_link_result
+import pandas as pd
+import json
+from Coordinator import AgentCoordinator
 
 
-# def main():
-#     agent = DemoAgent()
-#     query = input("Enter research query: ")
-#     results = agent.run(query)
 
-#     print("\n=== Candidate Set Statistics (Top 30 Retrieved) ===\n")
-#     print(f"Number of candidate papers: {results['stats']['n_papers']}")
-#     print(f"Missing abstracts: {results['stats']['missing_abstract_count']}")
-#     print(f"Average abstract length: {results['stats']['avg_abstract_length']}")
+def run_agentic_app(
+    user_input: str,
+    mode: str = "hybrid",
+    page_size: int = 10,
+    selection_mode: str = "interactive",
+    max_auto_trials: int = 5,
+    draw_plots: bool = True,
+):
+    app = AgentCoordinator(
+        mode=mode,
+        page_size=page_size,
+        selection_mode=selection_mode,
+        max_auto_trials=max_auto_trials,
+        draw_plots=draw_plots,
+    )
 
-#     print("\nTop journals:")
-#     for journal, count in results["stats"]["top_journals"]:
-#         print(f"- {journal}: {count}")
+    results = app.run(user_input)
 
-#     print("\nTop keywords:")
-#     for keyword, count in results["stats"]["top_keywords"]:
-#         print(f"- {keyword}: {count}")
+    if results.get("survival_table") is not None:
+        print("\n=== Survival Summary Table ===")
+        print(results["survival_table"])
 
-#     print("\n=== LLM Summary of Reranked Top 10 ===\n")
-#     print(results["summary"])
-
-#     print("\n=== Reranked Top Papers ===\n")
-#     for i, p in enumerate(results["papers"], 1):
-#         print(f"{i}. PMID: {p['pubmed_id']} | {p['title']}")
-
-def main():
-    agent =  DemoAgent()
-    print("Clinical Trial Agent (type 'exit' to quit)\n")
-
-    while True:
-        user_input = input("Query: ")
-
-        if user_input.lower() in ["exit", "quit"]:
-            break
-
-        try:
-            df = agent.run_agent(user_input)
-            print(f"\nFound {len(df)} trials\n")
-
-        except Exception as e:
-            print("Error:", e)
+    return results
 
 
 if __name__ == "__main__":
-    main()
+    user_input = input("Enter your trial search request: ").strip()
+
+    mode = input("Choose PubMed mode ('nct_only' or 'hybrid') [default: hybrid]: ").strip().lower()
+    if not mode:
+        mode = "hybrid"
+    if mode not in {"nct_only", "hybrid"}:
+        print("Invalid PubMed mode. Falling back to 'hybrid'.")
+        mode = "hybrid"
+
+    selection_mode = input("Choose selection mode ('interactive' or 'auto') [default: interactive]: ").strip().lower()
+    if not selection_mode:
+        selection_mode = "interactive"
+    if selection_mode not in {"interactive", "auto"}:
+        print("Invalid selection mode. Falling back to 'interactive'.")
+        selection_mode = "interactive"
+
+    results = run_agentic_app(
+        user_input=user_input,
+        mode=mode,
+        page_size=10,
+        selection_mode=selection_mode,
+        max_auto_trials=5,
+        draw_plots=True,
+    )
