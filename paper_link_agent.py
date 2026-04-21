@@ -23,7 +23,9 @@ import pandas as pd
 
 from base_agent import BaseAgent
 from linker import dedup_papers_by_pmid
-from llm import build_plot_rows_from_extraction, get_best_text_for_extraction, read_pdf_text
+from tools.stats import build_plot_rows_from_extraction
+from tools.pmc import get_best_text_for_extraction
+from tools.pdf import read_pdf_text
 from prompts import (
     PAPER_LINK_SYSTEM_PROMPT,
     build_paper_link_semantic_terms_prompt,

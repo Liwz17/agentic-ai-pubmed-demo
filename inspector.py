@@ -10,7 +10,7 @@ from prompts import (
     build_inspector_survival_eligibility_prompt,
     build_inspector_trial_paper_judging_prompt,
 )
-from llm import get_best_text_for_extraction
+from tools.pmc import get_best_text_for_extraction
 
 
 class InspectorAgent(BaseAgent):

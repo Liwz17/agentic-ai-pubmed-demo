@@ -1,7 +1,8 @@
 from typing import Dict, Any, List, Optional
 import pandas as pd
 from tools import query_pubmed
-from llm import llm_extract_trial_semantic_terms, llm_judge_trial_papers, llm_extract_survival_from_text, read_pdf_text, llm_judge_survival_plot_eligibility
+from tools.pdf import read_pdf_text
+from llm import llm_extract_trial_semantic_terms, llm_judge_trial_papers, llm_extract_survival_from_text, llm_judge_survival_plot_eligibility
 import re
 from tools import (
     extract_trial_retrieval_fields,

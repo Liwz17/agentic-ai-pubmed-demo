@@ -1,7 +1,8 @@
 from collections import Counter
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
 import matplotlib.pyplot as plt
-
 import textwrap
 
 def wrap_text(text, width=36, max_lines=None):
@@ -520,3 +521,84 @@ def draw_multi_trial_forest_plot(all_plot_rows):
 
     plt.tight_layout()
     plt.show()
+
+
+
+def _to_float_or_none(x):
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "":
+        return None
+    if s.lower() in {"nr", "not reached", "na", "n/a", "none", "null"}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _normalize_unit(unit: Optional[str]) -> Optional[str]:
+    if unit is None:
+        return None
+    u = str(unit).strip().lower()
+    if u in {"month", "months", "mo", "mos"}:
+        return "months"
+    if u in {"year", "years", "yr", "yrs"}:
+        return "years"
+    return u if u else None
+
+
+def build_plot_rows_from_extraction(
+    extraction_result: Dict[str, Any],
+    trial_id: Optional[str] = None,
+    trial_label: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Convert a survival extraction result into plot-ready rows (one per arm).
+    Units are preserved exactly as extracted — no conversion.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    if not extraction_result.get("outcome_found", False):
+        return rows
+
+    paper_id = extraction_result.get("paper_id")
+    source_used = extraction_result.get("source_used")
+
+    for arm in extraction_result.get("arms", []):
+        arm_name = arm.get("arm_name", "unknown arm")
+
+        median_os_value = _to_float_or_none(arm.get("median_os_value"))
+        median_os_unit = _normalize_unit(arm.get("median_os_unit"))
+        ci_lower = _to_float_or_none(arm.get("ci_lower"))
+        ci_upper = _to_float_or_none(arm.get("ci_upper"))
+        ci_unit = _normalize_unit(arm.get("ci_unit")) or median_os_unit
+
+        arm_n = arm.get("arm_sample_size")
+        try:
+            arm_n = None if arm_n in [None, "", "null", "None"] else int(float(arm_n))
+        except Exception:
+            arm_n = None
+
+        rows.append({
+            "trial_id": trial_id,
+            "trial_label": trial_label,
+            "paper_id": paper_id,
+            "source_used": source_used,
+            "arm_name": arm_name,
+            "display_label": f"{trial_label} | {arm_name}" if trial_label else arm_name,
+            "median_os_raw": arm.get("median_os_raw"),
+            "ci_95_raw": arm.get("ci_95_raw"),
+            "median_os_value": median_os_value,
+            "median_os_unit": median_os_unit,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "ci_unit": ci_unit,
+            "sample_size": arm_n,
+            "arm_sample_size": arm_n,
+            "arm_sample_size_raw": arm.get("arm_sample_size_raw"),
+            "plot_eligible": median_os_value is not None,
+            "evidence": arm.get("evidence", ""),
+        })
+
+    return rows
