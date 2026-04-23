@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(R --version)",
+      "Bash(R -e \"install.packages\\('rootSolve', repos='https://cran.r-project.org', type='binary'\\)\")",
+      "Bash(R -e ' *)",
+      "Bash(gfortran --version)",
+      "Read(//opt/homebrew/Cellar/gcc/15.2.0/lib/gcc/current/**)",
+      "Read(//Users/wli13/**)",
+      "Read(//Users/wli13/.R/**)",
+      "Bash(mkdir -p ~/.R)",
+      "Bash(cat)",
+      "Bash(R -e \"install.packages\\('AHSurv', repos='https://cran.r-project.org'\\)\")",
+      "Bash(R -e \"library\\(AHSurv\\); head\\(ipass\\); cat\\('ipass rows:', nrow\\(ipass\\), '\\\\n'\\)\")",
+      "Bash(R -e \"install.packages\\('bshazard', repos='https://cran.r-project.org'\\)\")",
+      "Bash(R -e \"library\\(bshazard\\); cat\\('bshazard version:', as.character\\(packageVersion\\('bshazard'\\)\\), '\\\\n'\\)\")",
+      "Bash(jupyter kernelspec *)",
+      "Bash(python3 -m jupyter kernelspec list)",
+      "Bash(conda run *)",
+      "Bash(R -e \"requireNamespace\\('IRkernel', quietly=TRUE\\)\")",
+      "Bash(R -e \"if \\(!requireNamespace\\('survminer', quietly=TRUE\\)\\) install.packages\\('survminer', repos='https://cran.r-project.org'\\)\")",
+      "Bash(jupyter nbconvert *)",
+      "Bash(/Users/wli13/venvs/lambda/bin/jupyter kernelspec *)",
+      "Bash(/Users/wli13/venvs/lambda/bin/jupyter nbconvert *)",
+      "Bash(python3 -c ' *)",
+      "Bash(R -e \"library\\(AHSurv\\); ?ipass\")",
+      "Bash(R -e \"if \\(!requireNamespace\\('muhaz', quietly=TRUE\\)\\) install.packages\\('muhaz', repos='https://cran.r-project.org'\\) else cat\\('muhaz ok\\\\n'\\)\")",
+      "Bash(R -e \"if \\(!requireNamespace\\('flexsurv', quietly=TRUE\\)\\) install.packages\\('flexsurv', repos='https://cran.r-project.org'\\) else cat\\('flexsurv ok\\\\n'\\)\")",
+      "Bash(Rscript -e ' *)",
+      "Bash(Rscript as8.r)"
+    ]
+  }
+}

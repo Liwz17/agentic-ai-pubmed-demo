@@ -1,4 +1,5 @@
 import time
+from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 from pymed import PubMed
 import requests
@@ -8,6 +9,36 @@ DEFAULT_MAX_PAPERS = 10
 PUBMED_SLEEP_SECONDS = 0.5
 
 PUBMED_CACHE = {}
+
+# ---------------------------------------------------------------------------
+# PubMedFilter — optional per-query publication filters
+# ---------------------------------------------------------------------------
+
+_PUB_TYPE_MAP: Dict[str, str] = {
+    "clinical_trial": "Clinical Trial[Publication Type]",
+    "rct": "Randomized Controlled Trial[Publication Type]",
+    "meta_analysis": "Meta-Analysis[Publication Type]",
+    "systematic_review": "Systematic Review[Publication Type]",
+}
+
+# PubMed has no "Final Report" publication type; approximate via title/abstract.
+_FINAL_REPORT_CLAUSE = (
+    '("final results"[Title/Abstract] OR "primary results"[Title/Abstract])'
+)
+
+
+@dataclass
+class PubMedFilter:
+    """
+    Optional filters to narrow PubMed queries by date and publication type.
+
+    publication_types — list of any of:
+        "clinical_trial", "rct", "meta_analysis", "systematic_review",
+        "final_report"   (approximated via title/abstract keywords)
+    """
+    pub_date_start: Optional[str] = None   # YYYY/MM/DD  (or YYYY)
+    pub_date_end: Optional[str] = None     # YYYY/MM/DD  (or YYYY)
+    publication_types: List[str] = field(default_factory=list)
 
 
 def _make_pubmed_client():
@@ -156,7 +187,34 @@ def query_pubmed_trial(
 
     return results
 
-from typing import List, Optional
+
+def _date_filter_clause(
+    start: Optional[str], end: Optional[str]
+) -> str:
+    """Build a PubMed publication-date range clause."""
+    if not start and not end:
+        return ""
+    s = start or "1900/01/01"
+    e = end or "3000/12/31"
+    return f'("{s}"[Date - Publication] : "{e}"[Date - Publication])'
+
+
+def _pub_type_clause(types: List[str]) -> str:
+    """
+    Build an OR clause for publication type filters.
+    "final_report" is approximated as a title/abstract keyword match.
+    """
+    clauses: List[str] = []
+    for t in types:
+        if t == "final_report":
+            clauses.append(_FINAL_REPORT_CLAUSE)
+        elif t in _PUB_TYPE_MAP:
+            clauses.append(_PUB_TYPE_MAP[t])
+    if not clauses:
+        return ""
+    if len(clauses) == 1:
+        return clauses[0]
+    return "(" + " OR ".join(clauses) + ")"
 
 
 def _term_clause(term: str, field: str = "Title/Abstract") -> str:
@@ -199,33 +257,46 @@ def build_structured_pubmed_query(
     drugs: Optional[List[str]] = None,
     phase: Optional[str] = None,
     require_clinical_trial: bool = True,
+    pubmed_filter: Optional["PubMedFilter"] = None,
 ) -> str:
     """
     Build structured PubMed query:
     (disease) AND (drug1 OR drug2) AND (phase) AND (clinical trial)
+    Optionally apply date-range and publication-type filters from pubmed_filter.
     """
 
     clauses = []
 
-    # 1️⃣ disease
+    # 1. disease
     if disease:
         clauses.append(_term_clause(disease))
 
-    # 2️⃣ drugs (OR)
+    # 2. drugs (OR)
     if drugs:
         drug_clauses = [_term_clause(d) for d in drugs if d]
         clauses.append(_or_clause(drug_clauses))
 
-    # 3️⃣ phase
+    # 3. phase
     phase_clause = _phase_to_clause(phase)
     if phase_clause:
         clauses.append(phase_clause)
 
-    # 4️⃣ clinical trial filter
+    # 4. clinical trial filter
     if require_clinical_trial:
         clauses.append("(Clinical Trial[Publication Type])")
 
-    # 5️⃣ combine
+    # 5. optional filters from PubMedFilter
+    if pubmed_filter:
+        date_clause = _date_filter_clause(
+            pubmed_filter.pub_date_start, pubmed_filter.pub_date_end
+        )
+        if date_clause:
+            clauses.append(date_clause)
+        pt_clause = _pub_type_clause(pubmed_filter.publication_types)
+        if pt_clause:
+            clauses.append(pt_clause)
+
+    # 6. combine
     return _and_clause(clauses)
 
 
@@ -280,13 +351,16 @@ def extract_trial_retrieval_fields(trial_row: dict) -> dict:
 
 
 
-def build_query_B_llm(fields: dict, semantic_terms: dict) -> str:
+def build_query_B_llm(
+    fields: dict,
+    semantic_terms: dict,
+    pubmed_filter: Optional["PubMedFilter"] = None,
+) -> str:
     clauses = []
 
     disease_terms = semantic_terms.get("disease_terms", []) or []
     drug_terms = semantic_terms.get("drug_terms", []) or []
     setting_terms = semantic_terms.get("setting_terms", []) or []
-    other_terms = semantic_terms.get("other_terms", []) or []
 
     # 1. disease: keep at most 1-2
     if disease_terms:
@@ -309,19 +383,45 @@ def build_query_B_llm(fields: dict, semantic_terms: dict) -> str:
     if phase_clause:
         clauses.append(phase_clause)
 
-    # 5. clinical trial filter
-    clauses.append("(Clinical Trial[Publication Type])")
+    # 5. publication type — use filter if given, else default to Clinical Trial
+    if pubmed_filter and pubmed_filter.publication_types:
+        pt = _pub_type_clause(pubmed_filter.publication_types)
+        if pt:
+            clauses.append(pt)
+    else:
+        clauses.append("(Clinical Trial[Publication Type])")
 
-    return " AND ".join([c for c in clauses if c])
+    # 6. date range
+    if pubmed_filter:
+        date_clause = _date_filter_clause(
+            pubmed_filter.pub_date_start, pubmed_filter.pub_date_end
+        )
+        if date_clause:
+            clauses.append(date_clause)
 
-def build_query_A(fields: dict) -> Optional[str]:
+    return _and_clause(clauses)
+
+def build_query_A(
+    fields: dict,
+    pubmed_filter: Optional["PubMedFilter"] = None,
+) -> Optional[str]:
     nct_id = fields.get("nct_id")
     if not nct_id:
         return None
-    return f"{nct_id}[All Fields]"
+    clauses = [f"{nct_id}[All Fields]"]
+    if pubmed_filter:
+        date_clause = _date_filter_clause(
+            pubmed_filter.pub_date_start, pubmed_filter.pub_date_end
+        )
+        if date_clause:
+            clauses.append(date_clause)
+    return _and_clause(clauses)
 
 
-def build_query_C(fields: dict) -> str:
+def build_query_C(
+    fields: dict,
+    pubmed_filter: Optional["PubMedFilter"] = None,
+) -> str:
     clauses = []
 
     disease = fields.get("disease")
@@ -339,9 +439,23 @@ def build_query_C(fields: dict) -> str:
     if phase_clause:
         clauses.append(phase_clause)
 
-    clauses.append("(Clinical Trial[Publication Type])")
+    # publication type — use filter if given, else default to Clinical Trial
+    if pubmed_filter and pubmed_filter.publication_types:
+        pt = _pub_type_clause(pubmed_filter.publication_types)
+        if pt:
+            clauses.append(pt)
+    else:
+        clauses.append("(Clinical Trial[Publication Type])")
 
-    return " AND ".join([c for c in clauses if c])
+    # date range
+    if pubmed_filter:
+        date_clause = _date_filter_clause(
+            pubmed_filter.pub_date_start, pubmed_filter.pub_date_end
+        )
+        if date_clause:
+            clauses.append(date_clause)
+
+    return _and_clause(clauses)
 
 
 def fetch_pubmed_abstract(pubmed_id: str) -> Dict[str, Any]:

@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 from trial_retrieval_agent import TrialRetrievalAgent
 from paper_link_agent import PaperLinkAgent
 from inspector import InspectorAgent
+from tools import PubMedFilter
+from tools.outcomes import build_outcome_summary_table
 
 
 class ConversationCoordinator:
@@ -37,6 +39,8 @@ class ConversationCoordinator:
         selection_mode: str = "interactive",
         max_auto_trials: int = 5,
         draw_plots: bool = True,
+        pubmed_filter: Optional[PubMedFilter] = None,
+        outcomes_raw: Optional[str] = None,
     ) -> None:
         self.trial_agent = TrialRetrievalAgent(
             page_size=page_size,
@@ -46,6 +50,8 @@ class ConversationCoordinator:
         self.paper_agent = PaperLinkAgent(
             mode=mode,
             draw_plots=draw_plots,
+            pubmed_filter=pubmed_filter,
+            outcomes_raw=outcomes_raw,
         )
         self.inspector = InspectorAgent()
 
@@ -76,7 +82,10 @@ class ConversationCoordinator:
         # --- Step 3: independent inspector review ---
         inspection_results = self._inspect_batch(per_trial_results)
 
-        survival_table = self.paper_agent.build_survival_table(per_trial_results)
+        if self.paper_agent.is_multi_outcome:
+            survival_table = build_outcome_summary_table(per_trial_results)
+        else:
+            survival_table = self.paper_agent.build_survival_table(per_trial_results)
 
         return {
             "status": "success",
@@ -148,6 +157,8 @@ def run_conversation(
     selection_mode: str = "interactive",
     max_auto_trials: int = 5,
     draw_plots: bool = True,
+    pubmed_filter: Optional[PubMedFilter] = None,
+    outcomes_raw: Optional[str] = None,
 ) -> Dict[str, Any]:
     app = ConversationCoordinator(
         mode=mode,
@@ -155,6 +166,8 @@ def run_conversation(
         selection_mode=selection_mode,
         max_auto_trials=max_auto_trials,
         draw_plots=draw_plots,
+        pubmed_filter=pubmed_filter,
+        outcomes_raw=outcomes_raw,
     )
 
     results = app.run(user_input)
@@ -211,6 +224,28 @@ if __name__ == "__main__":
         print("Invalid selection mode, falling back to 'interactive'.")
         selection_mode = "interactive"
 
+    # --- outcome selection ---
+    print("Outcomes to extract (free text, or Enter for OS only):")
+    print("  e.g.: 'OS, PFS, response rate'  or  'overall survival and grade 3/4 adverse events'")
+    outcomes_raw = input("  > ").strip() or None
+
+    # --- PubMed filters (optional) ---
+    pub_date_start = input("PubMed date start (YYYY/MM/DD, or Enter to skip): ").strip() or None
+    pub_date_end = input("PubMed date end   (YYYY/MM/DD, or Enter to skip): ").strip() or None
+
+    print("PubMed publication type filters (comma-separated, or Enter to skip):")
+    print("  options: clinical_trial, rct, meta_analysis, systematic_review, final_report")
+    pt_raw = input("  > ").strip()
+    publication_types = [x.strip() for x in pt_raw.split(",") if x.strip()] if pt_raw else []
+
+    pubmed_filter = None
+    if pub_date_start or pub_date_end or publication_types:
+        pubmed_filter = PubMedFilter(
+            pub_date_start=pub_date_start,
+            pub_date_end=pub_date_end,
+            publication_types=publication_types,
+        )
+
     run_conversation(
         user_input=user_input,
         mode=mode,
@@ -218,4 +253,6 @@ if __name__ == "__main__":
         selection_mode=selection_mode,
         max_auto_trials=5,
         draw_plots=True,
+        pubmed_filter=pubmed_filter,
+        outcomes_raw=outcomes_raw,
     )

@@ -11,7 +11,7 @@ API calls, or orchestration code.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +502,146 @@ def build_survival_extraction_prompt(
         source_used=source_used,
         source_text=source_text,
     )
+
+
+def build_outcome_parse_prompt(raw_input: str) -> str:
+    """
+    Ask LLM to parse the user's free-text outcome request into structured OutcomeSpec-compatible dicts.
+    """
+    return f"""You are a clinical research outcomes parsing assistant.
+
+The user wants to extract the following outcomes from clinical trial papers:
+"{raw_input}"
+
+Parse this into a structured list. For each distinct outcome:
+- key: a concise snake_case identifier (e.g. "overall_survival", "objective_response_rate", "grade34_ae_rate")
+- display: a clear human-readable label with abbreviation if applicable (e.g. "Overall Survival (OS)")
+- plot_type:
+    "forest"     — if it is a time-to-event outcome with a median (OS, PFS, DOR, EFS, etc.)
+    "bar"        — if it is a rate, proportion, or percentage (ORR, DCR, AE rate, CR rate, etc.)
+    "table_only" — for anything else (scores, counts, biomarker levels, etc.)
+
+Rules:
+- Normalize common abbreviations (OS → overall_survival, PFS → progression_free_survival, ORR → objective_response_rate, etc.)
+- Do not duplicate; if the user asks for "OS and overall survival" treat as one outcome
+- Return ONLY a JSON array, no explanation
+
+Example output:
+[
+  {{"key": "overall_survival", "display": "Overall Survival (OS)", "plot_type": "forest"}},
+  {{"key": "objective_response_rate", "display": "Objective Response Rate (ORR)", "plot_type": "bar"}}
+]
+
+User input: "{raw_input}"
+""".strip()
+
+
+def build_outcome_extraction_prompt(
+    pubmed_record: Dict[str, Any],
+    source_text: str,
+    source_used: str,
+    specs: List[Any],   # List[OutcomeSpec] — imported lazily to avoid circular dep
+    pmcid: Optional[str] = None,
+) -> str:
+    """
+    Dynamically build an extraction prompt from a list of OutcomeSpec objects.
+    Each spec carries key, display, and plot_type — the schema per outcome is
+    determined by plot_type.
+    """
+    outcome_lines = []
+    schema_blocks = []
+
+    for spec in specs:
+        key = spec.key
+        label = spec.display
+        if spec.plot_type == "forest":
+            outcome_lines.append(
+                f"- {label}: report median value, unit (months/years), "
+                f"95% CI lower and upper, and exact supporting quote"
+            )
+            schema_blocks.append(f'''      "{key}": {{
+        "found": true,
+        "value": "numeric string or null",
+        "unit": "months | years | null",
+        "ci_lower": "numeric string or null",
+        "ci_upper": "numeric string or null",
+        "ci_unit": "months | years | null",
+        "value_raw": "verbatim reported value",
+        "ci_raw": "verbatim reported CI",
+        "evidence": "exact supporting sentence"
+      }}''')
+        elif spec.plot_type == "bar":
+            outcome_lines.append(
+                f"- {label}: report rate as numeric %, "
+                f"responder count if available, and exact supporting quote"
+            )
+            schema_blocks.append(f'''      "{key}": {{
+        "found": true,
+        "value": "numeric percentage string or null",
+        "unit": "%",
+        "responders": "count string or null",
+        "value_raw": "verbatim reported value",
+        "ci_raw": "verbatim CI if any",
+        "evidence": "exact supporting sentence"
+      }}''')
+        else:
+            outcome_lines.append(
+                f"- {label}: report value, unit, and exact supporting quote"
+            )
+            schema_blocks.append(f'''      "{key}": {{
+        "found": true,
+        "value": "string or null",
+        "unit": "string or null",
+        "value_raw": "verbatim",
+        "evidence": "exact supporting sentence"
+      }}''')
+
+    outcomes_description = "\n".join(outcome_lines)
+    schema_content = ",\n".join(schema_blocks)
+    pubmed_id = pubmed_record.get("pubmed_id", "")
+
+    return f"""You are an expert biomedical information extraction assistant.
+
+Paper metadata:
+- PubMed ID: {pubmed_id}
+- PMCID: {pmcid or ""}
+- Title: {pubmed_record.get("title", "")}
+- Journal: {pubmed_record.get("journal", "")}
+- Year: {pubmed_record.get("year", "")}
+- Source used: {source_used}
+
+Task:
+Extract the following outcome(s) per treatment arm from the paper text below:
+{outcomes_description}
+
+Rules:
+1. Extract ONLY what is explicitly stated in the text. Do not infer or calculate.
+2. If a value is "not reached" or "NR", set "value" to null and preserve the raw text.
+3. Set "found": false for any outcome not reported in the paper.
+4. For single-arm studies, return one arm only.
+5. Include the exact supporting sentence or phrase in "evidence".
+6. Preserve reported numeric values exactly. Do not convert units.
+7. Output JSON only — no markdown, no explanation.
+
+Return ONLY JSON in this format:
+{{
+  "paper_id": "{pubmed_id}",
+  "arms": [
+    {{
+      "arm_name": "string",
+      "arm_sample_size": number or null,
+      "arm_sample_size_raw": "string or null",
+{schema_content}
+    }}
+  ],
+  "notes": "string"
+}}
+
+Text:
+\"\"\"
+{source_text}
+\"\"\"
+""".strip()
 
 
 def build_plot_row_summary_prompt(

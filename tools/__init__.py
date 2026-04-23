@@ -8,6 +8,7 @@ from .stats import (
 )
 from .trials import search_clinical_trials, select_trials_interactively
 from .pubmed_trials import (
+    PubMedFilter,
     _run_pubmed_query_once,
     _make_pubmed_client,
     _normalize_pubmed_results,

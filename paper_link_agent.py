@@ -29,11 +29,21 @@ from tools.pdf import read_pdf_text
 from prompts import (
     PAPER_LINK_SYSTEM_PROMPT,
     build_paper_link_semantic_terms_prompt,
+    build_outcome_parse_prompt,
+    build_outcome_extraction_prompt,
     build_survival_eligibility_prompt,
     build_survival_extraction_prompt,
     build_trial_paper_judging_prompt,
 )
+from tools.outcomes import (
+    OutcomeSpec,
+    DEFAULT_OUTCOME_SPECS,
+    build_multi_outcome_plot_rows,
+    draw_all_outcome_plots,
+    build_outcome_summary_table,
+)
 from tools import (
+    PubMedFilter,
     _run_pubmed_query_once,
     build_query_A,
     build_query_B_llm,
@@ -68,6 +78,8 @@ class PaperLinkAgent(BaseAgent):
         draw_plots: bool = True,
         max_papers_per_query: int = 5,
         max_text_chars: int = 12000,
+        pubmed_filter: Optional[PubMedFilter] = None,
+        outcomes_raw: Optional[str] = None,
         model: Optional[str] = None,
     ) -> None:
         super().__init__(system_prompt=PAPER_LINK_SYSTEM_PROMPT, model=model)
@@ -75,10 +87,53 @@ class PaperLinkAgent(BaseAgent):
         self.draw_plots = draw_plots
         self.max_papers_per_query = max_papers_per_query
         self.max_text_chars = max_text_chars
+        self.pubmed_filter = pubmed_filter
+        self._outcomes_raw = outcomes_raw
+        # parsed lazily on first run so __init__ makes no LLM calls
+        self.outcome_specs: Optional[List[OutcomeSpec]] = None
+
+    @property
+    def is_multi_outcome(self) -> bool:
+        specs = self.outcome_specs or DEFAULT_OUTCOME_SPECS
+        return not (len(specs) == 1 and specs[0].key == "overall_survival")
+
+    def _ensure_outcome_specs(self) -> None:
+        """Parse outcome_specs from raw user input on first call (lazy)."""
+        if self.outcome_specs is not None:
+            return
+        if self._outcomes_raw:
+            self.outcome_specs = self.parse_outcome_request(self._outcomes_raw)
+        else:
+            self.outcome_specs = list(DEFAULT_OUTCOME_SPECS)
 
     # ------------------------------------------------------------------
     # LLM-driven steps — the agent owns these
     # ------------------------------------------------------------------
+
+    def parse_outcome_request(self, raw_input: str) -> List[OutcomeSpec]:
+        """
+        One LLM call: parse the user's free-text outcome request into a list
+        of OutcomeSpec objects that drive all downstream extraction and plotting.
+        Called once per run_batch(), not once per trial.
+        """
+        prompt = build_outcome_parse_prompt(raw_input)
+        response = self._call_chat_model(user_message=prompt)
+        content = self._clean_json(response.choices[0].message.content or "")
+        try:
+            items = json.loads(content)
+            specs = [
+                OutcomeSpec(
+                    key=item["key"],
+                    display=item["display"],
+                    plot_type=item.get("plot_type", "table_only"),
+                )
+                for item in items
+                if "key" in item and "display" in item
+            ]
+            return specs or list(DEFAULT_OUTCOME_SPECS)
+        except Exception:
+            print("[PaperLinkAgent] outcome parse failed, falling back to OS only.")
+            return list(DEFAULT_OUTCOME_SPECS)
 
     def get_semantic_terms(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -228,6 +283,49 @@ class PaperLinkAgent(BaseAgent):
         result.setdefault("notes", "")
         return result
 
+    def extract_outcomes_from_text(
+        self,
+        pubmed_record: Dict[str, Any],
+        source_text: str,
+        source_used: str,
+        pmcid: Optional[str] = None,
+        trial_id: Optional[str] = None,
+        trial_label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Extract multiple user-requested outcomes per arm (OS, PFS, ORR, etc.).
+        Uses self.outcomes to determine what to ask for.
+        Returns a result dict with 'arms' (multi-outcome) and 'plot_rows'.
+        """
+        prompt = build_outcome_extraction_prompt(
+            pubmed_record,
+            source_text[: self.max_text_chars],
+            source_used,
+            self.outcome_specs or DEFAULT_OUTCOME_SPECS,
+            pmcid=pmcid,
+        )
+        response = self._call_chat_model(user_message=prompt)
+        content = self._clean_json(response.choices[0].message.content or "")
+        try:
+            result = json.loads(content)
+        except Exception as exc:
+            raise ValueError(
+                f"PaperLinkAgent.extract_outcomes_from_text: invalid JSON:\n{content}"
+            ) from exc
+
+        pubmed_id = str(pubmed_record.get("pubmed_id", ""))
+        result.setdefault("paper_id", pubmed_id)
+        result.setdefault("source_used", source_used)
+        result["pmcid"] = pmcid
+        result.setdefault("arms", [])
+        result.setdefault("notes", "")
+
+        result["plot_rows"] = build_multi_outcome_plot_rows(
+            result, self.outcome_specs or DEFAULT_OUTCOME_SPECS,
+            trial_id=trial_id, trial_label=trial_label,
+        )
+        return result
+
     # ------------------------------------------------------------------
     # Non-LLM retrieval — delegates to tools/linker utilities
     # ------------------------------------------------------------------
@@ -244,19 +342,24 @@ class PaperLinkAgent(BaseAgent):
         papers_A, papers_B, papers_C = [], [], []
         query_A = query_B = query_C = None
 
-        query_A = build_query_A(fields)
+        query_A = build_query_A(fields, pubmed_filter=self.pubmed_filter)
         if query_A:
+            print(f"  [Query A] {query_A}")
             papers_A = _run_pubmed_query_once(
                 query_A, max_papers=self.max_papers_per_query
             )
 
         if self.mode == "hybrid":
-            query_B = build_query_B_llm(fields, semantic_terms)
+            query_B = build_query_B_llm(
+                fields, semantic_terms, pubmed_filter=self.pubmed_filter
+            )
+            print(f"  [Query B] {query_B}")
             papers_B = _run_pubmed_query_once(
                 query_B, max_papers=self.max_papers_per_query
             )
 
-            query_C = build_query_C(fields)
+            query_C = build_query_C(fields, pubmed_filter=self.pubmed_filter)
+            print(f"  [Query C] {query_C}")
             papers_C = _run_pubmed_query_once(
                 query_C, max_papers=self.max_papers_per_query
             )
@@ -357,14 +460,16 @@ class PaperLinkAgent(BaseAgent):
             }
 
         try:
-            extraction = self.extract_survival_from_text(
-                pubmed_record,
-                source_text,
-                source_used,
-                pmcid=pmcid,
-                trial_id=trial_id,
-                trial_label=trial_label,
-            )
+            if self.is_multi_outcome:
+                extraction = self.extract_outcomes_from_text(
+                    pubmed_record, source_text, source_used,
+                    pmcid=pmcid, trial_id=trial_id, trial_label=trial_label,
+                )
+            else:
+                extraction = self.extract_survival_from_text(
+                    pubmed_record, source_text, source_used,
+                    pmcid=pmcid, trial_id=trial_id, trial_label=trial_label,
+                )
         except Exception as exc:
             empty_extraction["notes"] = f"Extraction failed: {exc}"
             return {
@@ -426,14 +531,16 @@ class PaperLinkAgent(BaseAgent):
 
         print("[PaperLinkAgent] Re-running extraction with user PDF...")
         try:
-            extraction = self.extract_survival_from_text(
-                pubmed_record,
-                pdf_text,
-                "user_pdf",
-                pmcid=None,
-                trial_id=trial_id,
-                trial_label=trial_label,
-            )
+            if self.is_multi_outcome:
+                extraction = self.extract_outcomes_from_text(
+                    pubmed_record, pdf_text, "user_pdf",
+                    pmcid=None, trial_id=trial_id, trial_label=trial_label,
+                )
+            else:
+                extraction = self.extract_survival_from_text(
+                    pubmed_record, pdf_text, "user_pdf",
+                    pmcid=None, trial_id=trial_id, trial_label=trial_label,
+                )
             extraction["user_pdf_path"] = pdf_path
         except Exception as exc:
             extraction["notes"] = (
@@ -511,6 +618,8 @@ class PaperLinkAgent(BaseAgent):
         trials: List[Dict[str, Any]],
         indices: List[int],
     ) -> Dict[str, Any]:
+        # parse outcome specs once before iterating trials (one LLM call total)
+        self._ensure_outcome_specs()
         results = []
         all_plot_rows = []
 
@@ -521,7 +630,10 @@ class PaperLinkAgent(BaseAgent):
                 all_plot_rows.extend(res["plot_rows"])
 
         if self.draw_plots and all_plot_rows:
-            draw_multi_trial_forest_plot(all_plot_rows)
+            if self.is_multi_outcome:
+                draw_all_outcome_plots(all_plot_rows, self.outcome_specs or DEFAULT_OUTCOME_SPECS)
+            else:
+                draw_multi_trial_forest_plot(all_plot_rows)
 
         return {
             "per_trial_results": results,
