@@ -8,6 +8,7 @@ rather than a hardcoded alias dict.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -29,11 +30,9 @@ class OutcomeSpec:
 
 DEFAULT_OUTCOME_SPECS: List[OutcomeSpec] = [
     OutcomeSpec(key="overall_survival", display="Overall Survival (OS)", plot_type="forest"),
+    OutcomeSpec(key="progression_free_survival", display="Progression-Free Survival (PFS)", plot_type="forest"),
+    OutcomeSpec(key="objective_response_rate", display="Objective Response Rate (ORR)", plot_type="bar"),
 ]
-
-# kept for the legacy OS-only extraction path in build_plot_rows_from_extraction (stats.py)
-TIME_BASED_OUTCOMES = {"overall_survival", "progression_free_survival", "duration_of_response"}
-RATE_OUTCOMES = {"objective_response_rate", "disease_control_rate", "complete_response_rate"}
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +49,38 @@ def _to_float_or_none(x: Any) -> Optional[float]:
         return float(s)
     except Exception:
         return None
+
+
+def _to_percent_or_none(x: Any) -> Optional[float]:
+    """Parse a percentage value from LLM output.
+
+    Handles: "62.5", "62.5%", "62.5% (45/72)", "45/72", "0.625" (proportion).
+    """
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s.lower() in {"nr", "not reached", "na", "n/a", "none", "null"}:
+        return None
+    # strip parenthetical e.g. "62.5% (45/72)" → "62.5%"
+    s = re.sub(r"\s*\(.*?\)", "", s).strip()
+    # strip % sign
+    s = s.replace("%", "").strip()
+    # try plain float
+    try:
+        val = float(s)
+        # if looks like a proportion (0 < val <= 1), convert to percentage
+        if 0 < val <= 1:
+            val = round(val * 100, 2)
+        return val
+    except Exception:
+        pass
+    # try fraction "N/M"
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)$", s)
+    if m:
+        num, den = float(m.group(1)), float(m.group(2))
+        if den > 0:
+            return round(num / den * 100, 2)
+    return None
 
 
 def _normalize_unit(unit: Any) -> Optional[str]:
@@ -93,10 +124,11 @@ def build_multi_outcome_plot_rows(
             if not data or not data.get("found"):
                 continue
 
-            value = _to_float_or_none(data.get("value"))
+            parse = _to_percent_or_none if spec.plot_type == "bar" else _to_float_or_none
+            value = parse(data.get("value"))
             unit = _normalize_unit(data.get("unit"))
-            ci_lower = _to_float_or_none(data.get("ci_lower"))
-            ci_upper = _to_float_or_none(data.get("ci_upper"))
+            ci_lower = parse(data.get("ci_lower"))
+            ci_upper = parse(data.get("ci_upper"))
             ci_unit = _normalize_unit(data.get("ci_unit")) or unit
 
             rows.append({
@@ -130,22 +162,76 @@ def build_multi_outcome_plot_rows(
 def draw_outcome_forest_plot(
     plot_rows: List[Dict[str, Any]],
     spec: OutcomeSpec,
-) -> None:
+    show: bool = True,
+):
+    """Returns (fig, unit_log). unit_log is a list of dicts with per-arm unit info."""
     rows = [r for r in plot_rows if r.get("outcome_key") == spec.key and r.get("plot_eligible")]
     if not rows:
         print(f"No eligible rows for {spec.display} forest plot.")
-        return
+        return None, []
 
     df = pd.DataFrame(rows).copy()
     for col in ["value", "ci_lower", "ci_upper"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df[df["value"].notna()].copy()
     if df.empty:
-        return
+        return None, []
 
     if "trial_label" not in df.columns:
         df["trial_label"] = "Unknown Trial"
     df["trial_label"] = df["trial_label"].fillna("Unknown Trial").astype(str)
+
+    # --- Unit normalization: convert years → months, skip everything else ---
+    unit_log: List[Dict[str, Any]] = []
+    converted_rows: List[Any] = []
+
+    for _, row in df.iterrows():
+        raw_unit = row.get("unit") or ""
+        norm = _normalize_unit(raw_unit)
+        orig_val = row["value"]
+        orig_lo = row["ci_lower"] if pd.notna(row["ci_lower"]) else None
+        orig_hi = row["ci_upper"] if pd.notna(row["ci_upper"]) else None
+
+        if norm == "months" or not norm:
+            conv_val, conv_lo, conv_hi = orig_val, orig_lo, orig_hi
+            note = "no conversion" if norm == "months" else "unit unknown, plotted as-is"
+            plotted_unit = "months"
+        elif norm == "years":
+            conv_val = orig_val * 12
+            conv_lo = orig_lo * 12 if orig_lo is not None else None
+            conv_hi = orig_hi * 12 if orig_hi is not None else None
+            note = "× 12 (years → months)"
+            plotted_unit = "months"
+        else:
+            conv_val = None
+            note = f"skipped: unsupported unit ({raw_unit or 'unknown'})"
+            plotted_unit = "—"
+            print(f"  [unit warning] {spec.display} | {row.get('trial_label')} | "
+                  f"{row.get('arm_name')}: {note}")
+
+        unit_log.append({
+            "outcome": spec.display,
+            "trial": row.get("trial_label", ""),
+            "arm": row.get("arm_name", ""),
+            "original_value": f"{orig_val} {raw_unit or '?'}".strip(),
+            "original_unit": raw_unit or "unknown",
+            "plotted_value": f"{conv_val:.2f} months" if conv_val is not None else "—",
+            "plotted_unit": plotted_unit,
+            "note": note,
+        })
+
+        if conv_val is not None:
+            r = row.copy()
+            r["value"] = conv_val
+            r["ci_lower"] = conv_lo
+            r["ci_upper"] = conv_hi
+            converted_rows.append(r)
+
+    if not converted_rows:
+        print(f"No plottable rows after unit normalization for {spec.display}.")
+        return None, unit_log
+
+    df = pd.DataFrame(converted_rows)
     df = df.sort_values(["trial_label", "value"], ascending=[True, True]).reset_index(drop=True)
 
     all_vals = [v for col in ["value", "ci_lower", "ci_upper"]
@@ -174,6 +260,7 @@ def draw_outcome_forest_plot(
             continue
         est, lo, hi, n_val = e["value"], e["ci_lower"], e["ci_upper"], e["sample_size"]
         ax.plot(est, i, "o", color="steelblue")
+        ci_note = None
         anchor = est
         if pd.notna(lo) and pd.notna(hi):
             ax.hlines(i, lo, hi, color="steelblue")
@@ -182,7 +269,7 @@ def draw_outcome_forest_plot(
             ax.hlines(i, lo, est, color="steelblue")
             ax.hlines(i, est, est + open_ext, linestyles="dashed", color="steelblue")
             anchor = est + open_ext
-            ax.text(anchor + r_offset, i, "upper NR", va="center", fontsize=8)
+            ci_note = "upper NR"
         elif pd.notna(hi):
             ax.hlines(i, est, hi, color="steelblue")
             ax.hlines(i, est - open_ext, est, linestyles="dashed", color="steelblue")
@@ -190,27 +277,34 @@ def draw_outcome_forest_plot(
         else:
             ax.hlines(i, est - open_ext / 2, est + open_ext / 2, linestyles="dashed", color="steelblue")
             anchor = est + open_ext / 2
-            ax.text(anchor + r_offset, i, "no CI", va="center", fontsize=8)
+            ci_note = "no CI"
+        # combine ci_note and n into one text to avoid overlap
+        parts = []
+        if ci_note:
+            parts.append(ci_note)
         if pd.notna(n_val):
             try:
-                ax.text(anchor + r_offset, i, f"  n={int(n_val)}", va="center", fontsize=9)
+                parts.append(f"n={int(n_val)}")
             except Exception:
                 pass
+        if parts:
+            ax.text(anchor + r_offset, i, "  ".join(parts), va="center", fontsize=8)
 
-    units = [r for r in df["unit"].dropna().unique() if r]
-    unit_label = units[0] if len(units) == 1 else "mixed units"
     ax.set_yticks(range(n))
     ax.set_yticklabels([e["label"] for e in entries])
     for tick, e in zip(ax.get_yticklabels(), entries):
         tick.set_fontweight("bold" if e["type"] == "header" else "normal")
         tick.set_fontsize(10 if e["type"] == "header" else 9)
-    ax.set_xlabel(f"{spec.display} ({unit_label})")
+    ax.set_xlabel(f"{spec.display} (months)")
     ax.set_title(f"Forest Plot — {spec.display}")
     ax.invert_yaxis()
     ax.set_xlim(x_min - 0.02 * x_range, x_max + 0.28 * x_range)
     ax.grid(True, axis="x", alpha=0.3)
     plt.tight_layout()
-    plt.show()
+    fig = plt.gcf()
+    if show:
+        plt.show()
+    return fig, unit_log
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +314,8 @@ def draw_outcome_forest_plot(
 def draw_outcome_bar_chart(
     plot_rows: List[Dict[str, Any]],
     spec: OutcomeSpec,
-) -> None:
+    show: bool = True,
+):
     rows = [r for r in plot_rows if r.get("outcome_key") == spec.key and r.get("plot_eligible")]
     if not rows:
         print(f"No eligible rows for {spec.display} bar chart.")
@@ -236,7 +331,7 @@ def draw_outcome_bar_chart(
         df["trial_label"] = "Unknown Trial"
     df["trial_label"] = df["trial_label"].fillna("Unknown Trial").astype(str)
     df["bar_label"] = df.apply(
-        lambda r: f"{_wrap(r['trial_label'], 24, 2)}\n{r['arm_name']}", axis=1
+        lambda r: f"{_wrap(r['trial_label'], 20, 1)}\n{_wrap(r['arm_name'], 20, 1)}", axis=1
     )
 
     palette = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -244,7 +339,7 @@ def draw_outcome_bar_chart(
     color_map = {t: palette[i % len(palette)] for i, t in enumerate(trials)}
     colors = df["trial_label"].map(color_map).tolist()
 
-    _, ax = plt.subplots(figsize=(max(6, 1.2 * len(df)), 5))
+    _, ax = plt.subplots(figsize=(max(6, 1.5 * len(df)), 6))
     x = range(len(df))
     bars = ax.bar(x, df["value"].tolist(), color=colors, edgecolor="white", width=0.6)
 
@@ -253,15 +348,18 @@ def draw_outcome_bar_chart(
                 f"{val:.1f}%", ha="center", va="bottom", fontsize=9)
 
     ax.set_xticks(list(x))
-    ax.set_xticklabels(df["bar_label"].tolist(), ha="center", fontsize=8)
+    ax.set_xticklabels(df["bar_label"].tolist(), rotation=40, ha="right", fontsize=8)
     ax.set_ylabel(f"{spec.display} (%)")
     ax.set_title(f"Bar Chart — {spec.display}")
     ax.set_ylim(0, min(115, df["value"].max() + 15))
     ax.grid(True, axis="y", alpha=0.3)
-    legend_handles = [mpatches.Patch(color=color_map[t], label=t) for t in trials]
-    ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
+    legend_handles = [mpatches.Patch(color=color_map[t], label=_wrap(t, 40, 2)) for t in trials]
+    ax.legend(handles=legend_handles, fontsize=8, loc="upper right", framealpha=0.85)
     plt.tight_layout()
-    plt.show()
+    fig = plt.gcf()
+    if show:
+        plt.show()
+    return fig, []
 
 
 # ---------------------------------------------------------------------------
@@ -271,10 +369,17 @@ def draw_outcome_bar_chart(
 def draw_all_outcome_plots(
     plot_rows: List[Dict[str, Any]],
     specs: List[OutcomeSpec],
-) -> None:
-    """Route to forest plot or bar chart based on spec.plot_type."""
+    show: bool = True,
+):
+    """
+    Route to forest/bar based on spec.plot_type.
+    Returns (figs, unit_logs) where unit_logs is a list of dicts
+    describing per-arm unit conversion for all forest-type outcomes.
+    """
     spec_map = {s.key: s for s in specs}
     seen_keys: set = set()
+    figs = []
+    unit_logs: List[Dict[str, Any]] = []
     for row in plot_rows:
         key = row.get("outcome_key")
         if key in seen_keys or not row.get("plot_eligible"):
@@ -284,10 +389,37 @@ def draw_all_outcome_plots(
         if spec is None:
             continue
         if spec.plot_type == "forest":
-            draw_outcome_forest_plot(plot_rows, spec)
+            fig, log = draw_outcome_forest_plot(plot_rows, spec, show=show)
+            unit_logs.extend(log)
         elif spec.plot_type == "bar":
-            draw_outcome_bar_chart(plot_rows, spec)
-        # "table_only" → skip figures, data is in the summary table
+            fig, _ = draw_outcome_bar_chart(plot_rows, spec, show=show)
+        else:
+            continue
+        if fig is not None:
+            figs.append(fig)
+    return figs, unit_logs
+
+
+# ---------------------------------------------------------------------------
+# Spec collection — derive specs from plot_rows (used in auto_primary mode)
+# ---------------------------------------------------------------------------
+
+def collect_specs_from_plot_rows(plot_rows: List[Dict[str, Any]]) -> List[OutcomeSpec]:
+    """
+    Reconstruct a deduplicated list of OutcomeSpec objects from plot_rows.
+    Works for both fixed-outcome and auto_primary modes, because plot_rows
+    always carry outcome_key, outcome_display, and plot_type.
+    """
+    seen: Dict[str, OutcomeSpec] = {}
+    for row in plot_rows:
+        key = row.get("outcome_key")
+        if key and key not in seen:
+            seen[key] = OutcomeSpec(
+                key=key,
+                display=row.get("outcome_display", key),
+                plot_type=row.get("plot_type", "table_only"),
+            )
+    return list(seen.values())
 
 
 # ---------------------------------------------------------------------------

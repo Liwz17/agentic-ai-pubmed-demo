@@ -27,7 +27,9 @@
       "Bash(R -e \"if \\(!requireNamespace\\('muhaz', quietly=TRUE\\)\\) install.packages\\('muhaz', repos='https://cran.r-project.org'\\) else cat\\('muhaz ok\\\\n'\\)\")",
       "Bash(R -e \"if \\(!requireNamespace\\('flexsurv', quietly=TRUE\\)\\) install.packages\\('flexsurv', repos='https://cran.r-project.org'\\) else cat\\('flexsurv ok\\\\n'\\)\")",
       "Bash(Rscript -e ' *)",
-      "Bash(Rscript as8.r)"
+      "Bash(Rscript as8.r)",
+      "Bash(\"/Users/wli13/Desktop/Research/Dr.Lee/assignment 4/AgenticAI/agentic_local/bin/python\" -c \"import streamlit; print\\(streamlit.__version__\\)\")",
+      "Bash(\"/Users/wli13/Desktop/Research/Dr.Lee/assignment 4/AgenticAI/agentic_local/bin/pip\" install streamlit)"
     ]
   }
 }

@@ -82,10 +82,7 @@ class ConversationCoordinator:
         # --- Step 3: independent inspector review ---
         inspection_results = self._inspect_batch(per_trial_results)
 
-        if self.paper_agent.is_multi_outcome:
-            survival_table = build_outcome_summary_table(per_trial_results)
-        else:
-            survival_table = self.paper_agent.build_survival_table(per_trial_results)
+        survival_table = build_outcome_summary_table(per_trial_results)
 
         return {
             "status": "success",

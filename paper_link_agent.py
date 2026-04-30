@@ -23,7 +23,6 @@ import pandas as pd
 
 from base_agent import BaseAgent
 from linker import dedup_papers_by_pmid
-from tools.stats import build_plot_rows_from_extraction
 from tools.pmc import get_best_text_for_extraction
 from tools.pdf import read_pdf_text
 from prompts import (
@@ -31,8 +30,8 @@ from prompts import (
     build_paper_link_semantic_terms_prompt,
     build_outcome_parse_prompt,
     build_outcome_extraction_prompt,
+    build_primary_endpoint_identification_prompt,
     build_survival_eligibility_prompt,
-    build_survival_extraction_prompt,
     build_trial_paper_judging_prompt,
 )
 from tools.outcomes import (
@@ -40,7 +39,6 @@ from tools.outcomes import (
     DEFAULT_OUTCOME_SPECS,
     build_multi_outcome_plot_rows,
     draw_all_outcome_plots,
-    build_outcome_summary_table,
 )
 from tools import (
     PubMedFilter,
@@ -48,7 +46,6 @@ from tools import (
     build_query_A,
     build_query_B_llm,
     build_query_C,
-    draw_multi_trial_forest_plot,
     extract_trial_retrieval_fields,
     fetch_pubmed_abstract,
 )
@@ -69,17 +66,18 @@ class PaperLinkAgent(BaseAgent):
     - PubMed query building and execution  →  tools/
     - Candidate deduplication              →  linker.dedup_papers_by_pmid
     - PMC / abstract text fetching         →  llm.get_best_text_for_extraction
-    - Plot-row construction                →  llm.build_plot_rows_from_extraction
+    - Plot-row construction                →  tools/outcomes.build_multi_outcome_plot_rows
     """
 
     def __init__(
         self,
-        mode: str = "hybrid",
+        mode: str = "nct_only",
         draw_plots: bool = True,
         max_papers_per_query: int = 5,
         max_text_chars: int = 12000,
         pubmed_filter: Optional[PubMedFilter] = None,
         outcomes_raw: Optional[str] = None,
+        enable_pdf_prompt: bool = True,
         model: Optional[str] = None,
     ) -> None:
         super().__init__(system_prompt=PAPER_LINK_SYSTEM_PROMPT, model=model)
@@ -89,13 +87,11 @@ class PaperLinkAgent(BaseAgent):
         self.max_text_chars = max_text_chars
         self.pubmed_filter = pubmed_filter
         self._outcomes_raw = outcomes_raw
+        self.enable_pdf_prompt = enable_pdf_prompt
         # parsed lazily on first run so __init__ makes no LLM calls
         self.outcome_specs: Optional[List[OutcomeSpec]] = None
-
-    @property
-    def is_multi_outcome(self) -> bool:
-        specs = self.outcome_specs or DEFAULT_OUTCOME_SPECS
-        return not (len(specs) == 1 and specs[0].key == "overall_survival")
+        # True when user requests per-paper primary endpoint discovery
+        self.auto_primary: bool = False
 
     def _ensure_outcome_specs(self) -> None:
         """Parse outcome_specs from raw user input on first call (lazy)."""
@@ -115,12 +111,20 @@ class PaperLinkAgent(BaseAgent):
         One LLM call: parse the user's free-text outcome request into a list
         of OutcomeSpec objects that drive all downstream extraction and plotting.
         Called once per run_batch(), not once per trial.
+
+        Special case: if the LLM returns the sentinel key "__auto_primary__",
+        sets self.auto_primary = True and returns [] — specs are determined
+        per paper by identify_primary_endpoint().
         """
         prompt = build_outcome_parse_prompt(raw_input)
         response = self._call_chat_model(user_message=prompt)
         content = self._clean_json(response.choices[0].message.content or "")
         try:
             items = json.loads(content)
+            if any(item.get("key") == "__auto_primary__" for item in items):
+                print("[PaperLinkAgent] Auto-primary mode: primary endpoint will be identified per paper.")
+                self.auto_primary = True
+                return []
             specs = [
                 OutcomeSpec(
                     key=item["key"],
@@ -134,6 +138,45 @@ class PaperLinkAgent(BaseAgent):
         except Exception:
             print("[PaperLinkAgent] outcome parse failed, falling back to OS only.")
             return list(DEFAULT_OUTCOME_SPECS)
+
+    def identify_primary_endpoint(
+        self,
+        pubmed_record: Dict[str, Any],
+        source_text: str,
+        pmcid: Optional[str] = None,
+    ) -> tuple:
+        """
+        Per-paper LLM call: read the paper and return the primary endpoint(s).
+        Returns (List[OutcomeSpec], raw_result_dict).
+        raw_result_dict contains the full LLM response including evidence quotes.
+        Returns ([], {}) if the primary endpoint cannot be identified.
+        """
+        prompt = build_primary_endpoint_identification_prompt(
+            pubmed_record, source_text[: self.max_text_chars], pmcid=pmcid
+        )
+        response = self._call_chat_model(user_message=prompt)
+        content = self._clean_json(response.choices[0].message.content or "")
+        try:
+            raw = json.loads(content)
+        except Exception:
+            print(f"[PaperLinkAgent] Primary endpoint identification JSON parse failed for PMID={pubmed_record.get('pubmed_id')}.")
+            return [], {}
+
+        if not raw.get("found"):
+            print(f"  [auto-primary] Primary endpoint not found: {raw.get('notes', '')}")
+            return [], raw
+
+        specs = []
+        for item in raw.get("primary_endpoints", []):
+            if "key" not in item or "display" not in item:
+                continue
+            specs.append(OutcomeSpec(
+                key=item["key"],
+                display=item["display"],
+                plot_type=item.get("plot_type", "table_only"),
+            ))
+            print(f"  [auto-primary] Identified: {item['display']} | evidence: {item.get('evidence', '')[:80]}")
+        return specs, raw
 
     def get_semantic_terms(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -197,7 +240,7 @@ class PaperLinkAgent(BaseAgent):
         pmcid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Ask the LLM whether this paper is eligible for arm-level OS extraction.
+        Ask the LLM whether this paper is eligible for arm-level efficacy extraction.
         """
         prompt = build_survival_eligibility_prompt(
             pubmed_record,
@@ -216,73 +259,6 @@ class PaperLinkAgent(BaseAgent):
                 "reason": "Eligibility JSON parse failed; defaulting to extraction.",
             }
 
-    def extract_survival_from_text(
-        self,
-        pubmed_record: Dict[str, Any],
-        source_text: str,
-        source_used: str,
-        pmcid: Optional[str] = None,
-        trial_id: Optional[str] = None,
-        trial_label: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Ask the LLM to extract median OS by arm, then normalize the result
-        and build plot-ready rows.
-        """
-        prompt = build_survival_extraction_prompt(
-            pubmed_record, source_text, source_used, pmcid=pmcid
-        )
-        response = self._call_chat_model(user_message=prompt)
-        content = self._clean_json(response.choices[0].message.content or "")
-        try:
-            result = json.loads(content)
-        except Exception as exc:
-            raise ValueError(
-                f"PaperLinkAgent.extract_survival_from_text: invalid JSON:\n{content}"
-            ) from exc
-
-        # --- normalize mandatory fields ---
-        pubmed_id = str(pubmed_record.get("pubmed_id", ""))
-        result.setdefault("paper_id", pubmed_id)
-        result.setdefault("outcome_found", False)
-        result.setdefault("outcome_type", "overall_survival")
-        result.setdefault("source_used", source_used)
-        result["pmcid"] = pmcid
-        if result.get("arms") is None:
-            result["arms"] = []
-
-        # --- normalize each arm ---
-        normalized_arms = []
-        for arm in result.get("arms", []):
-            arm_n = arm.get("arm_sample_size")
-            if arm_n in ["", "null", "None", None]:
-                arm_n = None
-            else:
-                try:
-                    arm_n = int(float(arm_n))
-                except Exception:
-                    arm_n = None
-            normalized_arms.append({
-                "arm_name": arm.get("arm_name", "unknown arm"),
-                "arm_sample_size_raw": arm.get("arm_sample_size_raw"),
-                "arm_sample_size": arm_n,
-                "median_os_raw": arm.get("median_os_raw"),
-                "median_os_value": arm.get("median_os_value"),
-                "median_os_unit": arm.get("median_os_unit"),
-                "ci_95_raw": arm.get("ci_95_raw"),
-                "ci_lower": arm.get("ci_lower"),
-                "ci_upper": arm.get("ci_upper"),
-                "ci_unit": arm.get("ci_unit"),
-                "evidence": arm.get("evidence", ""),
-            })
-        result["arms"] = normalized_arms
-
-        result["plot_rows"] = build_plot_rows_from_extraction(
-            result, trial_id=trial_id, trial_label=trial_label
-        )
-        result.setdefault("notes", "")
-        return result
-
     def extract_outcomes_from_text(
         self,
         pubmed_record: Dict[str, Any],
@@ -291,17 +267,19 @@ class PaperLinkAgent(BaseAgent):
         pmcid: Optional[str] = None,
         trial_id: Optional[str] = None,
         trial_label: Optional[str] = None,
+        specs: Optional[List[OutcomeSpec]] = None,
     ) -> Dict[str, Any]:
         """
-        Extract multiple user-requested outcomes per arm (OS, PFS, ORR, etc.).
-        Uses self.outcomes to determine what to ask for.
-        Returns a result dict with 'arms' (multi-outcome) and 'plot_rows'.
+        Extract outcomes per arm from paper text.
+        specs: which outcomes to extract. Defaults to self.outcome_specs.
+               Pass a per-paper list when self.auto_primary is True.
         """
+        effective_specs = specs if specs is not None else (self.outcome_specs or DEFAULT_OUTCOME_SPECS)
         prompt = build_outcome_extraction_prompt(
             pubmed_record,
             source_text[: self.max_text_chars],
             source_used,
-            self.outcome_specs or DEFAULT_OUTCOME_SPECS,
+            effective_specs,
             pmcid=pmcid,
         )
         response = self._call_chat_model(user_message=prompt)
@@ -319,9 +297,16 @@ class PaperLinkAgent(BaseAgent):
         result["pmcid"] = pmcid
         result.setdefault("arms", [])
         result.setdefault("notes", "")
+        arm_meta = {"arm_name", "arm_sample_size", "arm_sample_size_raw"}
+        result["outcome_found"] = any(
+            isinstance(v, dict) and v.get("found")
+            for arm in result["arms"]
+            for k, v in arm.items()
+            if k not in arm_meta
+        )
 
         result["plot_rows"] = build_multi_outcome_plot_rows(
-            result, self.outcome_specs or DEFAULT_OUTCOME_SPECS,
+            result, effective_specs,
             trial_id=trial_id, trial_label=trial_label,
         )
         return result
@@ -459,17 +444,32 @@ class PaperLinkAgent(BaseAgent):
                 "survival_extraction": empty_extraction,
             }
 
+        # In auto_primary mode, identify the primary endpoint from this paper first
+        extraction_specs: Optional[List[OutcomeSpec]] = None
+        primary_endpoint_identification: Optional[Dict[str, Any]] = None
+        if self.auto_primary:
+            print(f"  [auto-primary] Identifying primary endpoint for PMID={pubmed_id}...")
+            identified, id_raw = self.identify_primary_endpoint(pubmed_record, source_text, pmcid=pmcid)
+            primary_endpoint_identification = id_raw
+            if not identified:
+                empty_extraction["source_used"] = source_used
+                empty_extraction["notes"] = "Auto-primary: could not identify primary endpoint from paper text."
+                return {
+                    "status": "skipped",
+                    "message": "Auto-primary mode: primary endpoint not identified.",
+                    "pubmed_record": pubmed_record,
+                    "eligibility_judgment": eligibility,
+                    "primary_endpoint_identification": primary_endpoint_identification,
+                    "survival_extraction": empty_extraction,
+                }
+            extraction_specs = identified
+
         try:
-            if self.is_multi_outcome:
-                extraction = self.extract_outcomes_from_text(
-                    pubmed_record, source_text, source_used,
-                    pmcid=pmcid, trial_id=trial_id, trial_label=trial_label,
-                )
-            else:
-                extraction = self.extract_survival_from_text(
-                    pubmed_record, source_text, source_used,
-                    pmcid=pmcid, trial_id=trial_id, trial_label=trial_label,
-                )
+            extraction = self.extract_outcomes_from_text(
+                pubmed_record, source_text, source_used,
+                pmcid=pmcid, trial_id=trial_id, trial_label=trial_label,
+                specs=extraction_specs,
+            )
         except Exception as exc:
             empty_extraction["notes"] = f"Extraction failed: {exc}"
             return {
@@ -490,7 +490,9 @@ class PaperLinkAgent(BaseAgent):
             "message": "Survival extraction completed.",
             "pubmed_record": pubmed_record,
             "eligibility_judgment": eligibility,
+            "primary_endpoint_identification": primary_endpoint_identification,
             "survival_extraction": extraction,
+            "source_text": source_text,
         }
 
     def _try_pdf_fallback(
@@ -505,6 +507,9 @@ class PaperLinkAgent(BaseAgent):
         Offer the user a chance to supply a local PDF when only the abstract
         was used, then re-run extraction if a valid path is given.
         """
+        if not self.enable_pdf_prompt:
+            return extraction
+
         print(f"\n[PaperLinkAgent] Abstract-only extraction for PMID {pubmed_id}.")
         print(f"  Title: {pubmed_record.get('title', '')}")
         choice = input("Provide a local PDF for a second-pass extraction? [y/N]: ").strip().lower()
@@ -531,16 +536,10 @@ class PaperLinkAgent(BaseAgent):
 
         print("[PaperLinkAgent] Re-running extraction with user PDF...")
         try:
-            if self.is_multi_outcome:
-                extraction = self.extract_outcomes_from_text(
-                    pubmed_record, pdf_text, "user_pdf",
-                    pmcid=None, trial_id=trial_id, trial_label=trial_label,
-                )
-            else:
-                extraction = self.extract_survival_from_text(
-                    pubmed_record, pdf_text, "user_pdf",
-                    pmcid=None, trial_id=trial_id, trial_label=trial_label,
-                )
+            extraction = self.extract_outcomes_from_text(
+                pubmed_record, pdf_text, "user_pdf",
+                pmcid=None, trial_id=trial_id, trial_label=trial_label,
+            )
             extraction["user_pdf_path"] = pdf_path
         except Exception as exc:
             extraction["notes"] = (
@@ -564,6 +563,7 @@ class PaperLinkAgent(BaseAgent):
           5. Fetch paper, screen eligibility   (LLM)
           6. Extract arm-level survival data   (LLM)
         """
+        self._ensure_outcome_specs()  # parse outcomes on first call if not yet done
         self.clear()  # each trial is independent — reset conversation history
         print(f"\n[PaperLinkAgent] Processing trial {idx}...")
 
@@ -630,10 +630,7 @@ class PaperLinkAgent(BaseAgent):
                 all_plot_rows.extend(res["plot_rows"])
 
         if self.draw_plots and all_plot_rows:
-            if self.is_multi_outcome:
-                draw_all_outcome_plots(all_plot_rows, self.outcome_specs or DEFAULT_OUTCOME_SPECS)
-            else:
-                draw_multi_trial_forest_plot(all_plot_rows)
+            draw_all_outcome_plots(all_plot_rows, self.outcome_specs or DEFAULT_OUTCOME_SPECS)  # unit_logs discarded in CLI mode
 
         return {
             "per_trial_results": results,

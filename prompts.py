@@ -327,19 +327,23 @@ SURVIVAL_TASK_PROMPTS: Dict[str, str] = {
 You are an expert biomedical trial-reading assistant.
 
 Task:
-Determine whether this paper is appropriate for ARM-LEVEL overall survival extraction
-for a forest-plot style summary across trials.
+Determine whether this paper reports arm-level primary efficacy outcomes (such as OS, PFS,
+or response rate) suitable for quantitative extraction across treatment arms.
 
-The paper is ELIGIBLE only if it primarily reports study-level or treatment-arm-level
-overall survival outcomes, for example median OS by arm, with or without confidence intervals.
+The paper is ELIGIBLE only if ALL of the following are true:
+1. It is an interventional clinical trial (phase 1, 2, 3, or 4; or explicitly described
+   as a randomized controlled trial, open-label trial, single-arm trial, or similar).
+2. It reports efficacy outcomes at the treatment-arm level — meaning aggregate summary
+   statistics (e.g. median OS, median PFS, ORR%) for a defined treatment group,
+   not just individual patient-level narratives.
 
-The paper is NOT ELIGIBLE if it is mainly:
-- a case report
-- a case series
-- patient-by-patient narrative reporting
-- a review, commentary, or non-original trial report
-- a biomarker or correlative paper without treatment-arm-level survival extraction target
-- a paper that reports only individual patient outcomes rather than arm-level trial outcomes
+The paper is NOT ELIGIBLE if any of the following apply:
+- It is a case report or case series (no formal trial design)
+- It reports outcomes patient-by-patient without arm-level aggregate statistics
+- It is a review, meta-analysis, commentary, editorial, or protocol paper
+- It is a biomarker, correlative, or translational study without arm-level efficacy data
+- It is a retrospective chart review without a pre-specified trial design
+- The only "outcomes" reported are toxicity or safety without any efficacy endpoint
 
 Return JSON only in this format:
 {{
@@ -507,22 +511,29 @@ def build_survival_extraction_prompt(
 def build_outcome_parse_prompt(raw_input: str) -> str:
     """
     Ask LLM to parse the user's free-text outcome request into structured OutcomeSpec-compatible dicts.
+    If the user wants per-paper primary endpoint discovery, returns the sentinel __auto_primary__.
     """
     return f"""You are a clinical research outcomes parsing assistant.
 
 The user wants to extract the following outcomes from clinical trial papers:
 "{raw_input}"
 
-Parse this into a structured list. For each distinct outcome:
-- key: a concise snake_case identifier (e.g. "overall_survival", "objective_response_rate", "grade34_ae_rate")
-- display: a clear human-readable label with abbreviation if applicable (e.g. "Overall Survival (OS)")
+SPECIAL CASE — Auto primary-endpoint discovery:
+If the user is asking for the primary endpoint(s) of each paper to be automatically identified
+(e.g. "primary endpoint", "primary outcome", "main endpoint", "每篇paper的primary endpoint",
+"主要终点", "the paper's own primary endpoint", etc.), return ONLY this single-item array:
+[{{"key": "__auto_primary__", "display": "Primary Endpoint (auto-discover)", "plot_type": "auto"}}]
+
+Otherwise, parse each requested outcome into a structured list:
+- key: a concise snake_case identifier (e.g. "overall_survival", "objective_response_rate")
+- display: a clear human-readable label with abbreviation (e.g. "Overall Survival (OS)")
 - plot_type:
-    "forest"     — if it is a time-to-event outcome with a median (OS, PFS, DOR, EFS, etc.)
-    "bar"        — if it is a rate, proportion, or percentage (ORR, DCR, AE rate, CR rate, etc.)
-    "table_only" — for anything else (scores, counts, biomarker levels, etc.)
+    "forest"     — time-to-event outcome with a median (OS, PFS, DOR, EFS, etc.)
+    "bar"        — rate, proportion, or percentage (ORR, DCR, AE rate, CR rate, etc.)
+    "table_only" — anything else (scores, counts, biomarker levels, etc.)
 
 Rules:
-- Normalize common abbreviations (OS → overall_survival, PFS → progression_free_survival, ORR → objective_response_rate, etc.)
+- Normalize common abbreviations (OS → overall_survival, PFS → progression_free_survival, etc.)
 - Do not duplicate; if the user asks for "OS and overall survival" treat as one outcome
 - Return ONLY a JSON array, no explanation
 
@@ -572,13 +583,16 @@ def build_outcome_extraction_prompt(
       }}''')
         elif spec.plot_type == "bar":
             outcome_lines.append(
-                f"- {label}: report rate as numeric %, "
+                f"- {label}: report rate as numeric %, CI lower and upper if available, "
                 f"responder count if available, and exact supporting quote"
             )
             schema_blocks.append(f'''      "{key}": {{
         "found": true,
         "value": "numeric percentage string or null",
         "unit": "%",
+        "ci_lower": "numeric percentage string or null",
+        "ci_upper": "numeric percentage string or null",
+        "ci_unit": "%",
         "responders": "count string or null",
         "value_raw": "verbatim reported value",
         "ci_raw": "verbatim CI if any",
@@ -635,6 +649,70 @@ Return ONLY JSON in this format:
     }}
   ],
   "notes": "string"
+}}
+
+Text:
+\"\"\"
+{source_text}
+\"\"\"
+""".strip()
+
+
+def build_primary_endpoint_identification_prompt(
+    pubmed_record: Dict[str, Any],
+    source_text: str,
+    pmcid: Optional[str] = None,
+) -> str:
+    return f"""You are an expert clinical research reading assistant.
+
+Paper metadata:
+- PubMed ID: {pubmed_record.get("pubmed_id", "")}
+- PMCID: {pmcid or ""}
+- Title: {pubmed_record.get("title", "")}
+- Journal: {pubmed_record.get("journal", "")}
+- Year: {pubmed_record.get("year", "")}
+
+Task:
+Identify the PRIMARY ENDPOINT of this clinical trial paper using the two-step approach below.
+
+Step 1 — Explicit detection (preferred):
+Search for explicit statements such as:
+"primary endpoint", "primary outcome", "primary efficacy endpoint",
+"co-primary endpoints", "primary end point", "the study's primary measure", etc.
+If found, set "source": "explicit" and quote the exact sentence in "evidence".
+
+Step 2 — Inference (fallback, only if Step 1 finds nothing):
+If no explicit primary endpoint language exists, infer from the paper's structure and emphasis.
+Strong inference signals:
+- The outcome reported first and most prominently in the Results section
+- The outcome used for sample size / power calculation in the Methods
+- The outcome on which the trial's main conclusion is based
+- The outcome with the most statistical detail (p-value, HR, primary analysis label)
+If inferred, set "source": "inferred" and explain the reasoning in "evidence".
+
+Rules:
+1. Always try Step 1 first. Only use Step 2 if Step 1 yields nothing.
+2. If there are co-primary endpoints, return all of them.
+3. If neither step yields a confident answer, set "found": false.
+4. Classify plot_type:
+   - "forest" for time-to-event outcomes with a median (OS, PFS, DFS, EFS, DOR, etc.)
+   - "bar" for rates or proportions (ORR, DCR, CR rate, AE rate, etc.)
+   - "table_only" for anything else
+5. Return ONLY JSON, no explanation.
+
+Return ONLY JSON in this format:
+{{
+  "found": true,
+  "primary_endpoints": [
+    {{
+      "key": "overall_survival",
+      "display": "Overall Survival (OS)",
+      "plot_type": "forest",
+      "source": "explicit",
+      "evidence": "exact quote or inference reasoning"
+    }}
+  ],
+  "notes": "optional note"
 }}
 
 Text:

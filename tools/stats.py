@@ -92,7 +92,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def draw_single_trial_forest_plot(plot_rows, trial_label: str = None):
+def draw_single_trial_forest_plot(plot_rows, trial_label: str = None, show: bool = True):
     """
     Draw a forest-style plot for one selected trial only.
 
@@ -260,7 +260,10 @@ def draw_single_trial_forest_plot(plot_rows, trial_label: str = None):
     ax.set_xlim(x_min - left_pad, x_max + right_pad)
 
     plt.tight_layout()
-    plt.show()
+    fig = plt.gcf()
+    if show:
+        plt.show()
+    return fig
 
 
 
@@ -302,7 +305,7 @@ import textwrap
 import pandas as pd
 import matplotlib.pyplot as plt
 
-def draw_multi_trial_forest_plot(all_plot_rows):
+def draw_multi_trial_forest_plot(all_plot_rows, show: bool = True):
     """
     Draw one combined forest-style plot across multiple selected trials.
 
@@ -520,7 +523,10 @@ def draw_multi_trial_forest_plot(all_plot_rows):
             tick_label.set_fontsize(9)
 
     plt.tight_layout()
-    plt.show()
+    fig = plt.gcf()
+    if show:
+        plt.show()
+    return fig
 
 
 
