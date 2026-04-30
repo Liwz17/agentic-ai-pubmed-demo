@@ -83,7 +83,7 @@ overall survival and grade 3/4 adverse events
 **Auto-primary** — let the agent discover each paper's own primary endpoint:
 ```
 primary endpoint
-每篇paper的primary endpoint
+every paper's primary endpoint
 ```
 
 In auto-primary mode, the agent first looks for explicit statements ("the primary endpoint was…") and falls back to inferring from the paper's structure if none are found. Results in the Summary Table are labelled 🔵 explicit or 🟡 inferred.
