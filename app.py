@@ -6,6 +6,8 @@ Run with:
 """
 
 import io
+import json
+import base64
 import tempfile
 import os
 from typing import Optional
@@ -40,6 +42,171 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# Chat tool definitions
+# ---------------------------------------------------------------------------
+
+CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "plot_outcome",
+            "description": (
+                "Plot extracted outcome data as a forest or bar chart. "
+                "Use when the user asks to visualise, chart, or plot specific outcomes, trials, or arms."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "outcome_key": {
+                        "type": "string",
+                        "description": (
+                            "Snake-case outcome key, e.g. 'overall_survival', "
+                            "'progression_free_survival', 'objective_response_rate'. "
+                            "Omit or set to null to plot all available outcomes."
+                        ),
+                    },
+                    "trial_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "NCT IDs to include. Omit or set to null for all trials.",
+                    },
+                    "arm_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Arm names to include. Omit or set to null for all arms.",
+                    },
+                    "plot_type": {
+                        "type": "string",
+                        "enum": ["forest", "bar", "auto"],
+                        "description": "'forest', 'bar', or 'auto' (let the spec decide). Default 'auto'.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_table",
+            "description": (
+                "Show a summary table of extracted outcomes. "
+                "Use when the user asks for a table, summary, or spreadsheet view."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trial_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "NCT IDs to include. Omit or set to null for all trials.",
+                    },
+                    "outcome_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Outcome keys to include. Omit or set to null for all outcomes.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Chat tool execution helpers
+# ---------------------------------------------------------------------------
+
+def _execute_plot_outcome(args: dict, pr: dict):
+    """
+    Filter plot rows according to tool args and draw the requested figure.
+    Returns a matplotlib Figure or None if nothing matches.
+    """
+    outcome_key = args.get("outcome_key") or None
+    trial_ids = args.get("trial_ids") or None
+    arm_names = args.get("arm_names") or None
+    plot_type_override = args.get("plot_type") or "auto"
+
+    all_rows = pr.get("all_plot_rows", [])
+    specs = pr.get("specs", [])
+
+    # Filter to eligible rows first
+    rows = [r for r in all_rows if r.get("plot_eligible")]
+
+    if outcome_key:
+        rows = [r for r in rows if r.get("outcome_key") == outcome_key]
+    if trial_ids:
+        tids_lower = [t.lower() for t in trial_ids]
+        rows = [r for r in rows if (r.get("trial_id") or "").lower() in tids_lower]
+    if arm_names:
+        arms_lower = [a.lower() for a in arm_names]
+        rows = [r for r in rows if (r.get("arm_name") or "").lower() in arms_lower]
+
+    if not rows:
+        return None
+
+    # Determine which outcome keys are present
+    keys_present = list(dict.fromkeys(r["outcome_key"] for r in rows))
+    spec_map = {s.key: s for s in specs}
+
+    figs = []
+    for key in keys_present:
+        key_rows = [r for r in rows if r["outcome_key"] == key]
+        spec = spec_map.get(key)
+        if spec is None:
+            continue
+
+        # Resolve plot type
+        if plot_type_override == "forest" or (plot_type_override == "auto" and spec.plot_type == "forest"):
+            fig, _ = draw_outcome_forest_plot(key_rows, spec, show=False)
+        elif plot_type_override == "bar" or (plot_type_override == "auto" and spec.plot_type == "bar"):
+            fig, _ = draw_outcome_bar_chart(key_rows, spec, show=False)
+        else:
+            fig = None
+
+        if fig:
+            figs.append(fig)
+
+    # Return single fig or the first one (caller can iterate for multi-outcome)
+    return figs if figs else None
+
+
+def _execute_show_table(args: dict, pr: dict):
+    """
+    Build the outcome summary table and optionally filter by trial_ids / outcome_keys.
+    Returns a DataFrame or None.
+    """
+    trial_ids = args.get("trial_ids") or None
+    outcome_keys = args.get("outcome_keys") or None
+
+    per_trial_results = pr.get("per_trial_results", [])
+    df = build_outcome_summary_table(per_trial_results)
+
+    if df is None or df.empty:
+        return df
+
+    if trial_ids:
+        tids_lower = [t.lower() for t in trial_ids]
+        # The summary table has a column for trial/NCT ID — find it
+        nct_col = next(
+            (c for c in df.columns if "nct" in c.lower() or "trial" in c.lower()),
+            None,
+        )
+        if nct_col:
+            df = df[df[nct_col].str.lower().isin(tids_lower)]
+
+    if outcome_keys:
+        # Filter columns: keep identifier columns + any column matching an outcome key
+        id_cols = [c for c in df.columns if not any(ok in c.lower() for ok in outcome_keys)]
+        outcome_cols = [c for c in df.columns if any(ok in c.lower() for ok in outcome_keys)]
+        keep = id_cols[:2] + outcome_cols  # keep a couple of ID cols + matched outcome cols
+        df = df[[c for c in keep if c in df.columns]]
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -68,6 +235,11 @@ def _build_chat_context(per_trial_results: list) -> str:
         "For each trial you have the full paper text that was used for extraction, plus extraction metadata.",
         "Answer questions by reading the paper text directly. Be precise and quote from the text when relevant.",
         "If the answer cannot be determined from the available text, say so clearly.",
+        "",
+        "You have two tools available:",
+        "- plot_outcome: call this whenever the user asks to visualise, chart, plot, or graph outcomes.",
+        "- show_table: call this whenever the user asks for a table, summary, or spreadsheet view of outcomes.",
+        "Prefer calling a tool over describing data in prose when the user's intent is clearly visual.",
         "",
     ]
     for item in per_trial_results:
@@ -460,8 +632,8 @@ if "paper_results" in st.session_state:
 
     auto_primary = pr.get("auto_primary", False)
 
-    tab_summary, tab_plots, tab_custom, tab_qc, tab_pdf, tab_debug, tab_ask = st.tabs([
-        "Summary Table", "Plots", "Custom Plot", "QC Review", "Upload PDFs", "Debug", "Ask"
+    tab_summary, tab_plots, tab_custom, tab_ai_plot, tab_qc, tab_pdf, tab_debug, tab_ask = st.tabs([
+        "Summary Table", "Plots", "Custom Plot", "AI Plot", "QC Review", "Upload PDFs", "Debug", "Ask"
     ])
 
     # ── Summary Table ────────────────────────────────────────────────────────
@@ -656,6 +828,117 @@ if "paper_results" in st.session_state:
                     mime="image/png",
                 )
 
+    # ── AI Plot ──────────────────────────────────────────────────────────────
+    with tab_ai_plot:
+        st.caption("Describe what you want to plot. AI generates matplotlib code, renders it, and self-reviews.")
+
+        ai_plot_request = st.text_input(
+            "What do you want to plot?",
+            placeholder="e.g. Forest plot of OS by arm for all trials, blue color palette",
+            key="ai_plot_request",
+        )
+
+        col_gen, col_clear = st.columns([1, 4])
+        with col_gen:
+            gen_clicked = st.button("Generate Plot", type="primary", key="ai_plot_gen")
+        with col_clear:
+            if st.button("Clear", key="ai_plot_clear"):
+                for k in ["ai_plot_code", "ai_plot_fig_b64", "ai_plot_review", "ai_plot_fig", "ai_plotter"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+        if gen_clicked and ai_plot_request.strip():
+            eligible_rows = [r for r in all_plot_rows if r.get("plot_eligible")]
+            if not eligible_rows:
+                st.warning("No plottable data available.")
+            else:
+                from tools.sandbox_plot import run_sandboxed_plot
+                from tools.ai_plotter import AIPlotterAgent
+
+                plotter = AIPlotterAgent()
+
+                with st.spinner("Generating plot code…"):
+                    code = plotter.generate_code(eligible_rows, ai_plot_request.strip())
+                st.session_state["ai_plot_code"] = code
+
+                df = pd.DataFrame(eligible_rows)
+                fig, b64, err = run_sandboxed_plot(code, {"plot_rows": eligible_rows, "df": df})
+
+                if err:
+                    st.error(f"Plot execution error:\n```\n{err}\n```")
+                else:
+                    st.session_state["ai_plot_fig"] = fig
+                    st.session_state["ai_plot_fig_b64"] = b64
+
+                    with st.spinner("AI reviewing plot…"):
+                        review = plotter.review_plot(b64, ai_plot_request.strip())
+                    st.session_state["ai_plot_review"] = review
+                    st.session_state["ai_plotter"] = plotter
+
+        # Show current plot
+        if "ai_plot_fig" in st.session_state:
+            st.pyplot(st.session_state["ai_plot_fig"])
+            st.download_button(
+                "Download PNG",
+                data=base64.b64decode(st.session_state["ai_plot_fig_b64"]),
+                file_name="ai_plot.png",
+                mime="image/png",
+            )
+
+        # Show AI review
+        if "ai_plot_review" in st.session_state:
+            review_text = st.session_state["ai_plot_review"]
+            with st.expander("AI Review", expanded=True):
+                if "APPROVED" in review_text.upper():
+                    st.success("AI: Plot looks good.")
+                else:
+                    st.info(review_text[:500])
+                    if st.button("Apply AI Refinements", key="ai_plot_refine"):
+                        plotter = st.session_state.get("ai_plotter")
+                        if plotter:
+                            with st.spinner("Refining…"):
+                                new_code = plotter.refine_code(review_text)
+                            st.session_state["ai_plot_code"] = new_code
+                            from tools.sandbox_plot import run_sandboxed_plot
+                            eligible_rows = [r for r in all_plot_rows if r.get("plot_eligible")]
+                            df2 = pd.DataFrame(eligible_rows)
+                            fig2, b64_2, err2 = run_sandboxed_plot(new_code, {"plot_rows": eligible_rows, "df": df2})
+                            if err2:
+                                st.error(err2)
+                            else:
+                                st.session_state["ai_plot_fig"] = fig2
+                                st.session_state["ai_plot_fig_b64"] = b64_2
+                                st.rerun()
+
+        # Show generated code
+        if "ai_plot_code" in st.session_state:
+            with st.expander("Generated code", expanded=False):
+                st.code(st.session_state["ai_plot_code"], language="python")
+
+        # Follow-up refinement input
+        if "ai_plot_fig" in st.session_state:
+            followup = st.text_input(
+                "Ask for further changes",
+                placeholder="e.g. make the bars wider, use green colors, add gridlines",
+                key="ai_plot_followup",
+            )
+            if st.button("Apply Changes", key="ai_plot_followup_btn") and followup.strip():
+                plotter = st.session_state.get("ai_plotter")
+                if plotter:
+                    with st.spinner("Applying changes…"):
+                        new_code = plotter.refine_code(followup.strip())
+                    st.session_state["ai_plot_code"] = new_code
+                    from tools.sandbox_plot import run_sandboxed_plot
+                    eligible_rows = [r for r in all_plot_rows if r.get("plot_eligible")]
+                    df3 = pd.DataFrame(eligible_rows)
+                    fig3, b64_3, err3 = run_sandboxed_plot(new_code, {"plot_rows": eligible_rows, "df": df3})
+                    if err3:
+                        st.error(err3)
+                    else:
+                        st.session_state["ai_plot_fig"] = fig3
+                        st.session_state["ai_plot_fig_b64"] = b64_3
+                        st.rerun()
+
     # ── QC Review ───────────────────────────────────────────────────────────
     with tab_qc:
         for item in inspection_results:
@@ -847,14 +1130,48 @@ if "paper_results" in st.session_state:
             context = _build_chat_context(per_trial_results)
             _chat_agent = BaseAgent(system_prompt=context)
             for msg in st.session_state["chat_history"][:-1]:
-                _chat_agent.add_message(msg["role"], msg["content"])
+                if msg["role"] in ("user", "assistant"):
+                    _chat_agent.add_message(msg["role"], msg["content"])
 
             with st.chat_message("assistant"):
                 with st.spinner(""):
                     resp = _chat_agent._call_chat_model(
-                        user_message=question, temperature=0.2
+                        user_message=question,
+                        temperature=0.2,
+                        tools=CHAT_TOOLS,
+                        tool_choice="auto",
                     )
-                    reply = resp.choices[0].message.content or ""
+                    msg = resp.choices[0].message
+
+                    reply = ""
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            fn = tc.function.name
+                            args = json.loads(tc.function.arguments)
+
+                            if fn == "plot_outcome":
+                                figs = _execute_plot_outcome(args, pr)
+                                if figs:
+                                    for fig in figs:
+                                        st.pyplot(fig)
+                                    outcome_label = args.get("outcome_key") or "all outcomes"
+                                    reply = f"Here is the plot for {outcome_label}."
+                                else:
+                                    reply = "No plottable data matched your request."
+
+                            elif fn == "show_table":
+                                df_chat = _execute_show_table(args, pr)
+                                if df_chat is not None and not df_chat.empty:
+                                    st.dataframe(df_chat, use_container_width=True)
+                                    reply = "Here is the summary table."
+                                else:
+                                    reply = "No data matched your request."
+
+                            else:
+                                reply = f"Unknown tool: {fn}"
+                    else:
+                        reply = msg.content or ""
+
                 st.markdown(reply)
 
             st.session_state["chat_history"].append({"role": "assistant", "content": reply})
