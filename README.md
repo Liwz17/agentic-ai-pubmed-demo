@@ -132,6 +132,17 @@ tools/
 
 ---
 
+## Recent improvements
+
+- **Paper selection step** — After finding papers, the UI now shows all candidate papers per trial as a multiselect. The AI pre-selects the best match; the user can add, remove, or skip any paper before extraction runs. Each selected paper is extracted independently.
+- **Multi-paper extraction** — Multiple papers from the same trial can be extracted in a single run, each producing its own result row.
+- **Stronger arm completeness** — The extraction prompt explicitly requires all treatment arms (experimental + control + subgroups), not just the first one found.
+- **AI Plot tab** — A new tab lets you describe a plot in plain text; the agent generates matplotlib code, executes it in a sandboxed environment, self-reviews the rendered image, and accepts follow-up refinements.
+- **Ask tab tool calling** — The Q&A chat agent can now call `plot_outcome` and `show_table` tools directly, rendering figures and dataframes in the chat when the user asks for visuals.
+- **Sidebar reorder** — PubMed filters moved above Outcomes in the sidebar for a more logical configuration flow.
+
+---
+
 ## Notes
 
 - Full-text extraction via PMC is attempted first; falls back to abstract if unavailable. Abstract-only extraction is less reliable for multi-arm outcomes.
