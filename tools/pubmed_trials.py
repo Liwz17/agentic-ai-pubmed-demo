@@ -383,13 +383,11 @@ def build_query_B_llm(
     if phase_clause:
         clauses.append(phase_clause)
 
-    # 5. publication type — use filter if given, else default to Clinical Trial
+    # 5. publication type — only apply if user explicitly set a filter
     if pubmed_filter and pubmed_filter.publication_types:
         pt = _pub_type_clause(pubmed_filter.publication_types)
         if pt:
             clauses.append(pt)
-    else:
-        clauses.append("(Clinical Trial[Publication Type])")
 
     # 6. date range
     if pubmed_filter:
@@ -439,13 +437,11 @@ def build_query_C(
     if phase_clause:
         clauses.append(phase_clause)
 
-    # publication type — use filter if given, else default to Clinical Trial
+    # publication type — only apply if user explicitly set a filter
     if pubmed_filter and pubmed_filter.publication_types:
         pt = _pub_type_clause(pubmed_filter.publication_types)
         if pt:
             clauses.append(pt)
-    else:
-        clauses.append("(Clinical Trial[Publication Type])")
 
     # date range
     if pubmed_filter:

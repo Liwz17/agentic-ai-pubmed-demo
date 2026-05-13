@@ -630,10 +630,16 @@ Extract the following outcome(s) per treatment arm from the paper text below:
 
 Rules:
 1. Extract ONLY what is explicitly stated in the text. Do not infer or calculate.
-2. If a value is "not reached" or "NR", set "value" to null and preserve the raw text.
-3. Set "found": false for any outcome not reported in the paper.
-4. For single-arm studies, return one arm only.
-5. Include the exact supporting sentence or phrase in "evidence".
+2. COMPLETENESS IS CRITICAL — you MUST return ALL treatment arms reported in the paper,
+   not just the first or primary arm. Common arm patterns:
+   - Randomized trials: experimental arm(s) + control/placebo/SOC arm
+   - Multi-arm trials: every distinct dosing group, combination, or cohort
+   - Single-arm trials: one arm only
+   Scan the entire text (abstract, results tables, and results narrative) before finalizing.
+   A missing arm is a worse error than an uncertain value.
+3. If a value is "not reached" or "NR", set "value" to null and preserve the raw text in "value_raw".
+4. Set "found": false for any outcome not reported for a given arm (but still include the arm).
+5. Include the exact supporting sentence or phrase in "evidence" for each arm.
 6. Preserve reported numeric values exactly. Do not convert units.
 7. Output JSON only — no markdown, no explanation.
 

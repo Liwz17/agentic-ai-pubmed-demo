@@ -24,6 +24,8 @@ from tools.outcomes import (
     build_outcome_summary_table,
     collect_specs_from_plot_rows,
     draw_all_outcome_plots,
+    draw_outcome_forest_plot,
+    draw_outcome_bar_chart,
     DEFAULT_OUTCOME_SPECS,
 )
 
@@ -147,14 +149,6 @@ with st.sidebar:
     max_papers = st.slider("Max papers per query", 3, 20, 5)
 
     st.divider()
-    st.subheader("Outcomes to extract")
-    outcomes_raw = st.text_input(
-        "Outcomes (free text)",
-        placeholder="e.g. OS, PFS, response rate",
-        help="Leave blank to extract OS, PFS, and ORR (default). The LLM will parse any custom request.",
-    )
-
-    st.divider()
     st.subheader("PubMed filters (optional)")
     col1, col2 = st.columns(2)
     with col1:
@@ -168,12 +162,21 @@ with st.sidebar:
         default=[],
     )
 
+    st.divider()
+    st.subheader("Outcomes to extract")
+    outcomes_raw = st.text_input(
+        "Outcomes (free text)",
+        placeholder="e.g. OS, PFS, response rate",
+        help="Leave blank to extract OS, PFS, and ORR (default). The LLM will parse any custom request.",
+    )
+
 # ---------------------------------------------------------------------------
 # Session state helpers
 # ---------------------------------------------------------------------------
 
 def _reset_downstream(keep_trials: bool = False):
-    for key in ["paper_results", "inspection_results", "figures"]:
+    for key in ["paper_results", "inspection_results", "figures", "custom_fig", "custom_fig_name",
+                "paper_finding_results", "paper_agent_config"]:
         st.session_state.pop(key, None)
     if not keep_trials:
         st.session_state.pop("trial_packet", None)
@@ -287,9 +290,9 @@ if "trial_packet" in st.session_state:
             if selected_labels:
                 st.caption(f"{len(selected_labels)} trial(s) selected.")
 
-        st.subheader("Step 2 — Find Papers & Extract Outcomes")
+        st.subheader("Step 2 — Find Papers")
 
-        if st.button("Run pipeline on selected trials", type="primary"):
+        if st.button("Find Papers for Selected Trials", type="primary"):
             if not selected_labels:
                 st.warning("Please select at least one trial.")
             else:
@@ -300,31 +303,108 @@ if "trial_packet" in st.session_state:
                 pubmed_filter = _build_pubmed_filter()
                 paper_agent = PaperLinkAgent(
                     mode=pubmed_mode,
-                    draw_plots=False,          # we draw manually in Streamlit
+                    draw_plots=False,
                     max_papers_per_query=max_papers,
                     pubmed_filter=pubmed_filter,
                     outcomes_raw=outcomes_raw.strip() or None,
-                    enable_pdf_prompt=False,   # no blocking input() in Streamlit
+                    enable_pdf_prompt=False,
                 )
-                inspector = InspectorAgent()
+                paper_agent._ensure_outcome_specs()
 
-                progress = st.progress(0, text="Starting…")
-                per_trial_results = []
-                all_plot_rows = []
+                progress = st.progress(0, text="Finding papers…")
+                finding_results = []
 
                 for step, (trial, idx) in enumerate(zip(selected_trials, selected_labels)):
                     nct = trial.get("nct_id", f"trial {step+1}")
-                    progress.progress(
-                        (step) / len(selected_trials),
-                        text=f"Processing {nct}…",
+                    progress.progress(step / len(selected_trials), text=f"Searching papers for {nct}…")
+                    res = paper_agent.find_papers_for_trial(trial, idx)
+                    finding_results.append(res)
+
+                progress.progress(1.0, text="Paper search complete — review selections below.")
+                st.session_state["paper_finding_results"] = finding_results
+                st.session_state["paper_agent_config"] = {
+                    "mode": pubmed_mode,
+                    "max_papers": max_papers,
+                    "outcomes_raw": outcomes_raw.strip() or None,
+                    "auto_primary": paper_agent.auto_primary,
+                    "outcome_specs": paper_agent.outcome_specs,
+                }
+
+        if "paper_finding_results" in st.session_state:
+            finding_results = st.session_state["paper_finding_results"]
+
+            st.subheader("Step 2b — Select Papers")
+            st.caption("The AI has pre-selected a paper for each trial. Override any selection, then click Extract.")
+
+            for find_res in finding_results:
+                trial = find_res["trial"]
+                nct = trial.get("nct_id", "?")
+                link_result = find_res["link_result"]
+                candidates = link_result.get("all_candidates", [])
+                judge_result = link_result.get("judge_result", {}) or {}
+                ai_pmid = str(judge_result.get("selected_pubmed_id") or "")
+
+                with st.expander(f"{nct} — {(trial.get('brief_title') or '')[:80]}", expanded=True):
+                    if not candidates:
+                        st.warning("No candidate papers found for this trial.")
+                        continue
+
+                    option_pmids = [str(c.get("pubmed_id")) for c in candidates]
+                    option_labels = {
+                        str(c.get("pubmed_id")): (
+                            "🤖 " if str(c.get("pubmed_id")) == ai_pmid else ""
+                        ) + f"PMID {c.get('pubmed_id')} | {(c.get('title') or '')[:100]}"
+                        for c in candidates
+                    }
+                    default_sel = [ai_pmid] if ai_pmid in option_pmids else []
+
+                    st.multiselect(
+                        "Select papers to extract (leave empty to skip this trial)",
+                        options=option_pmids,
+                        default=default_sel,
+                        format_func=lambda pmid: option_labels.get(pmid, pmid),
+                        key=f"paper_sel_{nct}",
                     )
-                    res = paper_agent.run_one(trial, idx)
-                    per_trial_results.append(res)
-                    all_plot_rows.extend(res.get("plot_rows", []))
+                    st.caption(f"AI reason: {judge_result.get('reason', '—')}")
+
+            st.subheader("Step 3 — Extract Outcomes")
+            if st.button("Extract Outcomes from Selected Papers", type="primary"):
+                cfg = st.session_state.get("paper_agent_config", {})
+                pubmed_filter = _build_pubmed_filter()
+                paper_agent = PaperLinkAgent(
+                    mode=cfg.get("mode", pubmed_mode),
+                    draw_plots=False,
+                    max_papers_per_query=cfg.get("max_papers", max_papers),
+                    pubmed_filter=pubmed_filter,
+                    outcomes_raw=cfg.get("outcomes_raw"),
+                    enable_pdf_prompt=False,
+                )
+                paper_agent.auto_primary = cfg.get("auto_primary", False)
+                paper_agent.outcome_specs = cfg.get("outcome_specs")
+                inspector = InspectorAgent()
+
+                progress = st.progress(0, text="Extracting outcomes…")
+                per_trial_results = []
+                all_plot_rows = []
+
+                for step, find_res in enumerate(finding_results):
+                    trial = find_res["trial"]
+                    nct = trial.get("nct_id", f"trial {step+1}")
+
+                    selected_pmids = st.session_state.get(f"paper_sel_{nct}", [])
+
+                    if not selected_pmids:
+                        progress.progress(step / len(finding_results), text=f"Skipping {nct} (no paper selected)…")
+                        continue
+
+                    for pmid in selected_pmids:
+                        progress.progress(step / len(finding_results), text=f"Extracting {nct} PMID {pmid}…")
+                        res = paper_agent.extract_for_trial(find_res, selected_pmid=pmid)
+                        per_trial_results.append(res)
+                        all_plot_rows.extend(res.get("plot_rows", []))
 
                 progress.progress(1.0, text="Extraction complete.")
 
-                # inspector QC
                 inspection_results = []
                 for item in per_trial_results:
                     trial_fields = item["link_result"].get("trial_fields") or item["trial"]
@@ -344,9 +424,6 @@ if "trial_packet" in st.session_state:
                         "agent_eligibility_judgment": item["survival_result"].get("eligibility_judgment"),
                     })
 
-                # build figures (show=False → returns list)
-                # In auto_primary mode outcome_specs is [], so derive specs from the
-                # plot_rows themselves — works for both fixed and auto_primary modes.
                 if paper_agent.auto_primary and all_plot_rows:
                     specs = collect_specs_from_plot_rows(all_plot_rows)
                 else:
@@ -365,7 +442,7 @@ if "trial_packet" in st.session_state:
                 st.session_state["inspection_results"] = inspection_results
                 st.session_state["figures"] = figures
                 st.session_state["unit_logs"] = unit_logs
-                st.session_state["chat_history"] = []  # reset on new run
+                st.session_state["chat_history"] = []
 
 # ── Step 3: results ──────────────────────────────────────────────────────────
 
@@ -383,8 +460,8 @@ if "paper_results" in st.session_state:
 
     auto_primary = pr.get("auto_primary", False)
 
-    tab_summary, tab_plots, tab_qc, tab_pdf, tab_debug, tab_ask = st.tabs([
-        "Summary Table", "Plots", "QC Review", "Upload PDFs", "Debug", "Ask"
+    tab_summary, tab_plots, tab_custom, tab_qc, tab_pdf, tab_debug, tab_ask = st.tabs([
+        "Summary Table", "Plots", "Custom Plot", "QC Review", "Upload PDFs", "Debug", "Ask"
     ])
 
     # ── Summary Table ────────────────────────────────────────────────────────
@@ -498,6 +575,86 @@ if "paper_results" in st.session_state:
                         "see rows marked '—' below."
                     )
                 st.dataframe(log_df, use_container_width=True)
+
+    # ── Custom Plot ──────────────────────────────────────────────────────────
+    with tab_custom:
+        st.markdown("Pick specific trials and arms to generate a custom plot and download it.")
+
+        eligible_rows = [r for r in all_plot_rows if r.get("plot_eligible")]
+
+        if not eligible_rows:
+            st.info("No plottable data available.")
+        else:
+            # Step 1 — pick outcome
+            outcome_options = {}
+            for r in eligible_rows:
+                k = r["outcome_key"]
+                if k not in outcome_options:
+                    outcome_options[k] = r["outcome_display"]
+
+            selected_key = st.selectbox(
+                "Outcome",
+                options=list(outcome_options.keys()),
+                format_func=lambda k: outcome_options[k],
+            )
+
+            # Step 2 — pick trial+arm combinations for that outcome
+            outcome_eligible = [r for r in eligible_rows if r["outcome_key"] == selected_key]
+            combo_options = [
+                (r["trial_label"], r["arm_name"])
+                for r in outcome_eligible
+            ]
+            # deduplicate while preserving order
+            seen = set()
+            combo_options_deduped = []
+            for c in combo_options:
+                if c not in seen:
+                    seen.add(c)
+                    combo_options_deduped.append(c)
+
+            selected_combos = st.multiselect(
+                "Trials / Arms",
+                options=combo_options_deduped,
+                default=combo_options_deduped,
+                format_func=lambda c: f"{c[0]}  —  {c[1]}",
+            )
+
+            if st.button("Generate Custom Plot", type="primary"):
+                selected_set = set(selected_combos)
+                filtered_rows = [
+                    r for r in outcome_eligible
+                    if (r["trial_label"], r["arm_name"]) in selected_set
+                ]
+
+                spec_map = {s.key: s for s in specs}
+                spec = spec_map.get(selected_key)
+
+                if not filtered_rows or spec is None:
+                    st.warning("No data for the selected combination.")
+                else:
+                    if spec.plot_type == "forest":
+                        fig, _ = draw_outcome_forest_plot(filtered_rows, spec, show=False)
+                    elif spec.plot_type == "bar":
+                        fig, _ = draw_outcome_bar_chart(filtered_rows, spec, show=False)
+                    else:
+                        fig = None
+                        st.info(f"{spec.display} is table-only — no plot available.")
+
+                    if fig:
+                        st.session_state["custom_fig"] = fig
+                        st.session_state["custom_fig_name"] = (
+                            f"custom_{selected_key}.png"
+                        )
+
+            if "custom_fig" in st.session_state:
+                fig = st.session_state["custom_fig"]
+                st.pyplot(fig)
+                st.download_button(
+                    "Download PNG",
+                    _fig_to_bytes(fig),
+                    file_name=st.session_state.get("custom_fig_name", "custom_plot.png"),
+                    mime="image/png",
+                )
 
     # ── QC Review ───────────────────────────────────────────────────────────
     with tab_qc:

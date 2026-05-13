@@ -551,6 +551,85 @@ class PaperLinkAgent(BaseAgent):
     # Orchestration
     # ------------------------------------------------------------------
 
+    def find_papers_for_trial(
+        self, trial_row: Dict[str, Any], idx: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Steps 1-4 of run_one: retrieve candidates and judge the best paper.
+        Does NOT run eligibility screening or outcome extraction.
+        """
+        self._ensure_outcome_specs()
+        self.clear()
+        print(f"\n[PaperLinkAgent] Finding papers for trial {idx}...")
+
+        fields = extract_trial_retrieval_fields(trial_row)
+        semantic_terms = self.get_semantic_terms(fields)
+        retrieval = self._retrieve_candidates(fields, semantic_terms)
+        all_candidates = retrieval["all_candidates"]
+        print(
+            f"  Candidates: "
+            f"A={len(retrieval['papers_A'])} "
+            f"B={len(retrieval['papers_B'])} "
+            f"C={len(retrieval['papers_C'])} "
+            f"unique={len(all_candidates)}"
+        )
+
+        judge_result = self.judge_trial_papers(fields, all_candidates)
+        print(
+            f"  AI recommendation: match={judge_result.get('match_found')} | "
+            f"PMID={judge_result.get('selected_pubmed_id')}"
+        )
+
+        link_result = {
+            "mode": self.mode,
+            "trial_fields": fields,
+            "semantic_terms": semantic_terms,
+            "query_A": retrieval["query_A"],
+            "query_B": retrieval["query_B"],
+            "query_C": retrieval["query_C"],
+            "papers_A": retrieval["papers_A"],
+            "papers_B": retrieval["papers_B"],
+            "papers_C": retrieval["papers_C"],
+            "all_candidates": all_candidates,
+            "judge_result": judge_result,
+        }
+        return {"trial": trial_row, "semantic_terms": semantic_terms, "link_result": link_result}
+
+    def extract_for_trial(
+        self,
+        find_result: Dict[str, Any],
+        selected_pmid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Steps 5-6 of run_one: eligibility screen + outcome extraction.
+        selected_pmid: if provided and different from the AI pick, overrides the judge result.
+        """
+        trial_row = find_result["trial"]
+        link_result = find_result["link_result"]
+        judge_result = dict(link_result["judge_result"])
+
+        if selected_pmid and str(selected_pmid) != str(judge_result.get("selected_pubmed_id") or ""):
+            candidates = link_result.get("all_candidates", [])
+            matched = next((c for c in candidates if str(c.get("pubmed_id")) == str(selected_pmid)), None)
+            judge_result["selected_pubmed_id"] = selected_pmid
+            judge_result["match_found"] = True
+            judge_result["confidence"] = "user_selected"
+            judge_result["reason"] = "User manually selected this paper."
+            if matched:
+                judge_result["selected_title"] = matched.get("title")
+
+        self.clear()
+        survival_result = self._run_survival_pipeline(judge_result, trial_row)
+        plot_rows = survival_result.get("survival_extraction", {}).get("plot_rows", [])
+
+        return {
+            "trial": trial_row,
+            "semantic_terms": find_result.get("semantic_terms"),
+            "link_result": {**link_result, "judge_result": judge_result},
+            "survival_result": survival_result,
+            "plot_rows": plot_rows,
+        }
+
     def run_one(
         self, trial_row: Dict[str, Any], idx: Optional[int] = None
     ) -> Dict[str, Any]:
