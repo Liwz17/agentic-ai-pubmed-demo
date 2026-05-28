@@ -40,6 +40,22 @@ from tools.outcomes import (
     build_multi_outcome_plot_rows,
     draw_all_outcome_plots,
 )
+
+
+def _try_parse_json(content: str) -> Optional[Dict]:
+    """Try multiple JSON parse strategies; return None if all fail."""
+    try:
+        return json.loads(content)
+    except Exception:
+        pass
+    # Extract largest {...} block — handles preamble/postamble text from LLM
+    m = re.search(r'\{.*\}', content, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return None
 from tools import (
     PubMedFilter,
     _run_pubmed_query_once,
@@ -284,12 +300,11 @@ class PaperLinkAgent(BaseAgent):
         )
         response = self._call_chat_model(user_message=prompt)
         content = self._clean_json(response.choices[0].message.content or "")
-        try:
-            result = json.loads(content)
-        except Exception as exc:
-            raise ValueError(
-                f"PaperLinkAgent.extract_outcomes_from_text: invalid JSON:\n{content}"
-            ) from exc
+        result = _try_parse_json(content)
+        if result is None:
+            pmid_str = str(pubmed_record.get("pubmed_id", ""))
+            print(f"[PaperLinkAgent] extract_outcomes_from_text: JSON parse failed for PMID={pmid_str}; content[:200]: {content[:200]}")
+            result = {"arms": [], "notes": "JSON parse failed — LLM output was not valid JSON."}
 
         pubmed_id = str(pubmed_record.get("pubmed_id", ""))
         result.setdefault("paper_id", pubmed_id)
@@ -297,7 +312,7 @@ class PaperLinkAgent(BaseAgent):
         result["pmcid"] = pmcid
         result.setdefault("arms", [])
         result.setdefault("notes", "")
-        arm_meta = {"arm_name", "arm_sample_size", "arm_sample_size_raw"}
+        arm_meta = {"arm_name", "arm_sample_size", "arm_sample_size_raw", "subgroups"}
         result["outcome_found"] = any(
             isinstance(v, dict) and v.get("found")
             for arm in result["arms"]

@@ -643,7 +643,33 @@ if "paper_results" in st.session_state:
         if df.empty:
             st.info("No outcomes extracted.")
         else:
-            st.dataframe(df, use_container_width=True)
+            if "is_subgroup" not in df.columns:
+                df["is_subgroup"] = False
+
+            has_subgroups = bool(df["is_subgroup"].any())
+            show_subgroups = False
+            if has_subgroups:
+                show_subgroups = st.checkbox(
+                    "Show subgroup rows",
+                    value=False,
+                    help="Pre-specified biomarker/mutation-defined subgroup analyses, indented under their parent arm.",
+                )
+            display_df = df[~df["is_subgroup"]].copy() if (has_subgroups and not show_subgroups) else df.copy()
+
+            # Build a display column that visually indents subgroup rows
+            def _arm_display(r):
+                if r.get("is_subgroup"):
+                    return f"  ↳ {r['arm_name']} › {r.get('subgroup_name', '')}"
+                return r["arm_name"]
+
+            display_df["arm"] = display_df.apply(_arm_display, axis=1)
+            base_cols = ["nct_id", "trial_title", "pubmed_id", "arm", "arm_n"]
+            if has_subgroups and show_subgroups and "subgroup_n" in display_df.columns:
+                base_cols.append("subgroup_n")
+            base_cols += ["outcome", "value", "unit", "ci_lower", "ci_upper", "evidence"]
+            display_df = display_df[[c for c in base_cols if c in display_df.columns]]
+
+            st.dataframe(display_df, use_container_width=True)
             csv = df.to_csv(index=False).encode()
             st.download_button("Download CSV", csv, "outcomes.csv", "text/csv")
 
@@ -843,72 +869,135 @@ if "paper_results" in st.session_state:
             gen_clicked = st.button("Generate Plot", type="primary", key="ai_plot_gen")
         with col_clear:
             if st.button("Clear", key="ai_plot_clear"):
-                for k in ["ai_plot_code", "ai_plot_fig_b64", "ai_plot_review", "ai_plot_fig", "ai_plotter"]:
+                for k in ["ai_plot_code", "ai_plot_fig_b64", "ai_plot_review", "ai_plot_figs", "ai_plotter"]:
                     st.session_state.pop(k, None)
                 st.rerun()
 
-        if gen_clicked and ai_plot_request.strip():
+        if gen_clicked:
             eligible_rows = [r for r in all_plot_rows if r.get("plot_eligible")]
-            if not eligible_rows:
+            # Use all_plot_rows directly — values are already normalized floats or None
+            # (built by build_multi_outcome_plot_rows which calls _to_float_or_none).
+            # resolve_plot_rows() in the sandbox will run the evidence fallback and
+            # recalculate plot_eligible, so every recoverable row will be plotted.
+            ai_rows = [dict(r) for r in all_plot_rows]
+            st.session_state["ai_plot_rows"] = ai_rows
+            if not ai_rows:
                 st.warning("No plottable data available.")
+            elif not ai_plot_request.strip():
+                # Default: render same as Plots tab (uses only plot_eligible rows)
+                default_figs, _ = draw_all_outcome_plots(eligible_rows, specs, show=False)
+                if not default_figs:
+                    st.info("No plottable outcomes found.")
+                else:
+                    for k in ["ai_plot_code", "ai_plot_fig_b64", "ai_plot_review", "ai_plot_figs", "ai_plotter", "ai_plot_default_figs"]:
+                        st.session_state.pop(k, None)
+                    st.session_state["ai_plot_default_figs"] = default_figs
             else:
                 from tools.sandbox_plot import run_sandboxed_plot
                 from tools.ai_plotter import AIPlotterAgent
 
-                plotter = AIPlotterAgent()
+                plotter = AIPlotterAgent(model="openai/gpt-4o")
+                _df = pd.DataFrame(ai_rows)
+                _data = {"plot_rows": ai_rows, "df": _df}
+                MAX_RETRIES = 5
+                MAX_REVIEW_ROUNDS = 5
 
-                with st.spinner("Generating plot code…"):
-                    code = plotter.generate_code(eligible_rows, ai_plot_request.strip())
-                st.session_state["ai_plot_code"] = code
+                with st.status("Generating plot…", expanded=True) as status:
+                    st.write("Generating code…")
+                    code = plotter.generate_code(ai_rows, ai_plot_request.strip())
+                    st.session_state["ai_plot_code"] = code
 
-                df = pd.DataFrame(eligible_rows)
-                fig, b64, err = run_sandboxed_plot(code, {"plot_rows": eligible_rows, "df": df})
+                    figs, b64, err = None, None, None
+                    for attempt in range(1, MAX_RETRIES + 1):
+                        st.write(f"Running code (attempt {attempt}/{MAX_RETRIES})…")
+                        figs, b64, err = run_sandboxed_plot(code, _data)
+                        if not err:
+                            break
+                        st.write(f"⚠️ Error: `{err.splitlines()[-1]}`")
+                        if attempt < MAX_RETRIES:
+                            st.write("Fixing error…")
+                            code = plotter.fix_code(code, err)
+                            st.session_state["ai_plot_code"] = code
+                        else:
+                            st.write("Max retries reached.")
 
-                if err:
-                    st.error(f"Plot execution error:\n```\n{err}\n```")
-                else:
-                    st.session_state["ai_plot_fig"] = fig
-                    st.session_state["ai_plot_fig_b64"] = b64
+                    if err:
+                        status.update(label="Failed after retries", state="error")
+                        st.error(f"Could not render plot:\n```\n{err}\n```")
+                    else:
+                        # Auto review + refine loop (b64 of first figure sent for review)
+                        review = ""
+                        approved = False
+                        failed_attempts: list = []
+                        for round_n in range(1, MAX_REVIEW_ROUNDS + 1):
+                            st.write(f"Reviewing plot (round {round_n}/{MAX_REVIEW_ROUNDS})…")
+                            review = plotter.review_plot(b64, ai_plot_request.strip())
+                            # Only treat as approved if APPROVED appears as a standalone word
+                            # (not inside a checklist item like "1. PASS — looks approved")
+                            last_line = review.strip().splitlines()[-1].strip().upper() if review.strip() else ""
+                            if "APPROVED" in last_line and "ISSUES" not in last_line:
+                                st.write("✅ Plot approved.")
+                                approved = True
+                                break
+                            # Extract just the ISSUES section for the refine prompt
+                            issues_start = review.upper().find("ISSUES:")
+                            feedback = review[issues_start:].strip() if issues_start != -1 else review.strip()
+                            st.write(f"Issues found — refining… ({feedback[:120].strip()}…)")
+                            refined_code = plotter.refine_code(
+                                code, feedback, fig_base64=b64,
+                                failed_attempts=failed_attempts or None,
+                            )
+                            figs2, b64_2, err2 = run_sandboxed_plot(refined_code, _data)
+                            if err2:
+                                st.write(f"⚠️ Refinement error: `{err2.splitlines()[-1]}`")
+                                break
+                            code, figs, b64 = refined_code, figs2, b64_2
+                            st.session_state["ai_plot_code"] = code
+                            # Record this round's unresolved issues for next refinement call
+                            failed_attempts.append(f"Round {round_n}: {feedback[:200].strip()}")
 
-                    with st.spinner("AI reviewing plot…"):
-                        review = plotter.review_plot(b64, ai_plot_request.strip())
-                    st.session_state["ai_plot_review"] = review
-                    st.session_state["ai_plotter"] = plotter
+                        if not approved:
+                            st.write("⚠️ Max review rounds reached — plot shown with known issues.")
 
-        # Show current plot
-        if "ai_plot_fig" in st.session_state:
-            st.pyplot(st.session_state["ai_plot_fig"])
-            st.download_button(
-                "Download PNG",
-                data=base64.b64decode(st.session_state["ai_plot_fig_b64"]),
-                file_name="ai_plot.png",
-                mime="image/png",
-            )
+                        st.session_state["ai_plot_figs"] = figs
+                        st.session_state["ai_plot_fig_b64"] = b64
+                        st.session_state["ai_plot_review"] = review
+                        st.session_state["ai_plot_approved"] = approved
+                        st.session_state["ai_plotter"] = plotter
+                        st.session_state.pop("ai_plot_default_figs", None)
+                        status.update(
+                            label="Plot ready ✅" if approved else "Plot shown (not fully approved) ⚠️",
+                            state="complete" if approved else "error",
+                        )
 
-        # Show AI review
+        # Show default plots (empty input)
+        if "ai_plot_default_figs" in st.session_state:
+            for dfig in st.session_state["ai_plot_default_figs"]:
+                st.pyplot(dfig)
+
+        # Show current AI-generated plots (may be multiple figures)
+        if "ai_plot_figs" in st.session_state:
+            figs_to_show = st.session_state["ai_plot_figs"] or []
+            for i, f in enumerate(figs_to_show):
+                st.pyplot(f)
+            if figs_to_show and st.session_state.get("ai_plot_fig_b64"):
+                st.download_button(
+                    "Download first plot as PNG",
+                    data=base64.b64decode(st.session_state["ai_plot_fig_b64"]),
+                    file_name="ai_plot.png",
+                    mime="image/png",
+                )
+
+        # Show AI review summary (read-only, auto-applied above)
         if "ai_plot_review" in st.session_state:
             review_text = st.session_state["ai_plot_review"]
-            with st.expander("AI Review", expanded=True):
-                if "APPROVED" in review_text.upper():
-                    st.success("AI: Plot looks good.")
+            approved = st.session_state.get("ai_plot_approved", False)
+            with st.expander("AI Review", expanded=not approved):
+                if approved:
+                    st.success("AI: Plot passed all checks.")
                 else:
-                    st.info(review_text[:500])
-                    if st.button("Apply AI Refinements", key="ai_plot_refine"):
-                        plotter = st.session_state.get("ai_plotter")
-                        if plotter:
-                            with st.spinner("Refining…"):
-                                new_code = plotter.refine_code(review_text)
-                            st.session_state["ai_plot_code"] = new_code
-                            from tools.sandbox_plot import run_sandboxed_plot
-                            eligible_rows = [r for r in all_plot_rows if r.get("plot_eligible")]
-                            df2 = pd.DataFrame(eligible_rows)
-                            fig2, b64_2, err2 = run_sandboxed_plot(new_code, {"plot_rows": eligible_rows, "df": df2})
-                            if err2:
-                                st.error(err2)
-                            else:
-                                st.session_state["ai_plot_fig"] = fig2
-                                st.session_state["ai_plot_fig_b64"] = b64_2
-                                st.rerun()
+                    st.warning("Plot shown but AI review found unresolved issues:")
+                    st.info(review_text[:800])
 
         # Show generated code
         if "ai_plot_code" in st.session_state:
@@ -916,7 +1005,7 @@ if "paper_results" in st.session_state:
                 st.code(st.session_state["ai_plot_code"], language="python")
 
         # Follow-up refinement input
-        if "ai_plot_fig" in st.session_state:
+        if "ai_plot_figs" in st.session_state:
             followup = st.text_input(
                 "Ask for further changes",
                 placeholder="e.g. make the bars wider, use green colors, add gridlines",
@@ -925,17 +1014,18 @@ if "paper_results" in st.session_state:
             if st.button("Apply Changes", key="ai_plot_followup_btn") and followup.strip():
                 plotter = st.session_state.get("ai_plotter")
                 if plotter:
+                    current_code = st.session_state.get("ai_plot_code", "")
                     with st.spinner("Applying changes…"):
-                        new_code = plotter.refine_code(followup.strip())
+                        new_code = plotter.refine_code(current_code, followup.strip())
                     st.session_state["ai_plot_code"] = new_code
                     from tools.sandbox_plot import run_sandboxed_plot
-                    eligible_rows = [r for r in all_plot_rows if r.get("plot_eligible")]
-                    df3 = pd.DataFrame(eligible_rows)
-                    fig3, b64_3, err3 = run_sandboxed_plot(new_code, {"plot_rows": eligible_rows, "df": df3})
+                    ai_rows3 = st.session_state.get("ai_plot_rows") or [dict(r) for r in all_plot_rows]
+                    df3 = pd.DataFrame(ai_rows3)
+                    figs3, b64_3, err3 = run_sandboxed_plot(new_code, {"plot_rows": ai_rows3, "df": df3})
                     if err3:
                         st.error(err3)
                     else:
-                        st.session_state["ai_plot_fig"] = fig3
+                        st.session_state["ai_plot_figs"] = figs3
                         st.session_state["ai_plot_fig_b64"] = b64_3
                         st.rerun()
 

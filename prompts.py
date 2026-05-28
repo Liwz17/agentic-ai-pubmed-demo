@@ -567,35 +567,45 @@ def build_outcome_extraction_prompt(
         label = spec.display
         if spec.plot_type == "forest":
             outcome_lines.append(
-                f"- {label}: report median value, unit (months/years), "
-                f"95% CI lower and upper, and exact supporting quote"
+                f"- {label}: prefer median value in months/years with 95% CI. "
+                f"If the paper only reports a survival rate at a specific timepoint "
+                f"(e.g. '12-month OS rate 62%'), extract that percentage as value, "
+                f"set unit to '%', and record the timepoint in value_raw. "
+                f"Never leave value null when any numeric result is available."
             )
             schema_blocks.append(f'''      "{key}": {{
         "found": true,
-        "value": "numeric string or null",
-        "unit": "months | years | null",
-        "ci_lower": "numeric string or null",
-        "ci_upper": "numeric string or null",
-        "ci_unit": "months | years | null",
-        "value_raw": "verbatim reported value",
+        "value": "plain numeric or null (no units)",
+        "unit": "months | years | % | null",
+        "ci_lower": "plain numeric or null (no units, no % sign)",
+        "ci_upper": "plain numeric or null (no units, no % sign)",
+        "ci_unit": "months | years | % | null",
+        "value_raw": "verbatim reported value (include timepoint if rate, e.g. '62% at 12 months')",
         "ci_raw": "verbatim reported CI",
+        "hr": "hazard ratio as plain numeric or null (e.g. 0.74)",
+        "hr_ci_lower": "plain numeric or null",
+        "hr_ci_upper": "plain numeric or null",
+        "p_value": "p-value as string or null (e.g. '0.023', '<0.001')",
         "evidence": "exact supporting sentence"
       }}''')
         elif spec.plot_type == "bar":
             outcome_lines.append(
-                f"- {label}: report rate as numeric %, CI lower and upper if available, "
-                f"responder count if available, and exact supporting quote"
+                f"- {label}: report rate as numeric % (0–100 scale). "
+                f"If reported as a fraction (e.g. '48/64'), compute the percentage (75). "
+                f"If the rate is 0%, still extract value=0. "
+                f"CI lower and upper as plain numbers, responder count if available."
             )
             schema_blocks.append(f'''      "{key}": {{
         "found": true,
-        "value": "numeric percentage string or null",
+        "value": "numeric percentage 0-100 or null",
         "unit": "%",
-        "ci_lower": "numeric percentage string or null",
-        "ci_upper": "numeric percentage string or null",
+        "ci_lower": "plain numeric or null (no units, no % sign)",
+        "ci_upper": "plain numeric or null (no units, no % sign)",
         "ci_unit": "%",
         "responders": "count string or null",
         "value_raw": "verbatim reported value",
         "ci_raw": "verbatim CI if any",
+        "p_value": "p-value as string or null (e.g. '0.023', '<0.001')",
         "evidence": "exact supporting sentence"
       }}''')
         else:
@@ -640,8 +650,15 @@ Rules:
 3. If a value is "not reached" or "NR", set "value" to null and preserve the raw text in "value_raw".
 4. Set "found": false for any outcome not reported for a given arm (but still include the arm).
 5. Include the exact supporting sentence or phrase in "evidence" for each arm.
-6. Preserve reported numeric values exactly. Do not convert units.
-7. Output JSON only — no markdown, no explanation.
+6. Preserve reported numeric values exactly. Do not convert units (exception: rule 8).
+7. For rate/percentage outcomes: if reported as a fraction (e.g. "48/64 patients"), compute
+   and output the percentage (75). If the rate is 0%, output value=0, not null.
+   ci_lower and ci_upper must be plain numbers only — strip any unit suffix.
+8. For time-to-event outcomes (OS, PFS, DFS, DoR): if the paper only reports a survival/event-free
+   RATE at a timepoint (e.g. "12-month OS rate 62%", "2-year PFS 45%") instead of a median,
+   extract the percentage as value, unit="%", and include the timepoint in value_raw.
+   Never return value=null when any numeric result is present in the text.
+9. Output JSON only — no markdown, no explanation.
 
 Return ONLY JSON in this format:
 {{
@@ -651,11 +668,22 @@ Return ONLY JSON in this format:
       "arm_name": "string",
       "arm_sample_size": number or null,
       "arm_sample_size_raw": "string or null",
+{schema_content},
+      "subgroups": [
+        {{
+          "subgroup_name": "string (e.g. 'PD-L1 ≥1%', 'EGFR mutant')",
+          "subgroup_n": number or null,
 {schema_content}
+        }}
+      ]
     }}
   ],
   "notes": "string"
 }}
+
+For subgroups: only include pre-specified subgroup analyses reported in the Results section
+(e.g. biomarker-defined, mutation-defined). Omit subgroups if none are reported.
+Each subgroup inherits the same outcome schema as its parent arm.
 
 Text:
 \"\"\"

@@ -141,6 +141,17 @@ tools/
 - **Ask tab tool calling** — The Q&A chat agent can now call `plot_outcome` and `show_table` tools directly, rendering figures and dataframes in the chat when the user asks for visuals.
 - **Sidebar reorder** — PubMed filters moved above Outcomes in the sidebar for a more logical configuration flow.
 
+### AI Plot reliability overhaul
+
+- **Subgroup extraction** — Arm-level JSON now supports a `subgroups` array. `build_multi_outcome_plot_rows` and `build_outcome_summary_table` both process subgroup entries, displaying them indented under their parent arm in the Summary Table (toggle with "Show subgroup rows").
+- **Resilient JSON parsing** — `extract_outcomes_from_text` no longer raises on malformed LLM output; a `_try_parse_json` fallback recovers the largest `{...}` block before gracefully returning an empty result, so one bad paper does not abort the batch.
+- **NaN-safe data pipeline** — `resolve_plot_rows` in the sandbox explicitly converts `float('nan')` to `None` at three levels (_to_float, post-conversion cleanup, and `plot_eligible` recalculation), eliminating invisible bars caused by pandas converting `None` to `numpy.nan`.
+- **AI Plot uses normalised pipeline rows directly** — The AI Plot tab now passes `all_plot_rows` (already normalised by `build_multi_outcome_plot_rows`) straight to the sandbox instead of rebuilding from the Summary Table DataFrame, removing a lossy conversion step that introduced NaN.
+- **ZeroDivisionError guard** — The bar-chart code skeleton in the codegen prompt includes an explicit `if not arms or not trials` guard before `w = 0.7 / len(arms)`, and the refine loop no longer suggests raising exceptions as a fix.
+- **Failed-attempt memory in refine loop** — Each review-refine round appends the reviewer's unresolved feedback to a `failed_attempts` list. The next `refine_code` call receives this list as context so the model knows which approaches have already been tried and must try something different.
+- **Meaningful short display names** — Before generating code, `AIPlotterAgent.summarize_labels()` makes one dedicated LLM call to produce short (3–5 word), clinically meaningful aliases for every unique trial label and arm name. These aliases are injected into the codegen prompt as literal `trial_label_map` / `arm_label_map` dicts that the AI copies verbatim into its code, ensuring all axes and legend entries use readable names rather than truncated paper titles.
+- **Calibrated reviewer** — The review prompt now explicitly tells the reviewer that all axis labels are pre-computed aliases; short labels should be treated as intentional, not flagged as truncated. Only text physically clipped by the figure border counts as a failure.
+
 ---
 
 ## Notes

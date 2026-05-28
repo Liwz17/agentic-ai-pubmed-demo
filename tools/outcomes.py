@@ -45,10 +45,29 @@ def _to_float_or_none(x: Any) -> Optional[float]:
     s = str(x).strip()
     if not s or s.lower() in {"nr", "not reached", "na", "n/a", "none", "null"}:
         return None
+    # strip unit suffixes and % signs
+    s = re.sub(r"\s*(months?|years?|mo|yrs?|%)\s*$", "", s, flags=re.IGNORECASE).strip()
     try:
         return float(s)
     except Exception:
+        pass
+    # Handle mixed ranges like "NR–19.4" or "6.3 to NR": extract any number present
+    m = re.search(r"(\d+\.?\d*)", s)
+    return float(m.group(1)) if m else None
+
+
+def _to_int_or_none(x: Any) -> Optional[int]:
+    """Parse arm sample size; handles ranges like '100–150' by taking first number."""
+    if x is None:
         return None
+    s = str(x).strip()
+    if not s or s.lower() in {"nr", "na", "n/a", "none", "null"}:
+        return None
+    try:
+        return int(float(s))
+    except Exception:
+        m = re.search(r"(\d+)", s)
+        return int(m.group(1)) if m else None
 
 
 def _to_percent_or_none(x: Any) -> Optional[float]:
@@ -114,19 +133,22 @@ def build_multi_outcome_plot_rows(
     for arm in extraction.get("arms", []):
         arm_name = arm.get("arm_name", "unknown arm")
         arm_n_raw = arm.get("arm_sample_size")
-        try:
-            arm_n = None if arm_n_raw in [None, "", "null", "None"] else int(float(arm_n_raw))
-        except Exception:
-            arm_n = None
+        arm_n = _to_int_or_none(arm_n_raw)
 
         for spec in specs:
             data = arm.get(spec.key)
             if not data or not data.get("found"):
                 continue
 
-            parse = _to_percent_or_none if spec.plot_type == "bar" else _to_float_or_none
-            value = parse(data.get("value"))
             unit = _normalize_unit(data.get("unit"))
+            # If a forest-type outcome is reported as a rate (%), split it into a separate key
+            # so months and % rows never share the same outcome_key (causes mixed-axis confusion)
+            is_rate_format = spec.plot_type == "forest" and unit == "%"
+            effective_plot_type = "bar" if is_rate_format else spec.plot_type
+            effective_key = (spec.key + "_rate") if is_rate_format else spec.key
+            effective_display = (spec.display + " (rate %)") if is_rate_format else spec.display
+            parse = _to_percent_or_none if effective_plot_type == "bar" else _to_float_or_none
+            value = parse(data.get("value"))
             ci_lower = parse(data.get("ci_lower"))
             ci_upper = parse(data.get("ci_upper"))
             ci_unit = _normalize_unit(data.get("ci_unit")) or unit
@@ -137,9 +159,9 @@ def build_multi_outcome_plot_rows(
                 "paper_id": paper_id,
                 "source_used": source_used,
                 "arm_name": arm_name,
-                "outcome_key": spec.key,
-                "outcome_display": spec.display,
-                "plot_type": spec.plot_type,
+                "outcome_key": effective_key,
+                "outcome_display": effective_display,
+                "plot_type": effective_plot_type,
                 "value": value,
                 "unit": unit,
                 "ci_lower": ci_lower,
@@ -150,7 +172,55 @@ def build_multi_outcome_plot_rows(
                 "evidence": data.get("evidence", ""),
                 "sample_size": arm_n,
                 "plot_eligible": value is not None,
+                "is_subgroup": False,
+                "subgroup_name": None,
+                "subgroup_of": None,
             })
+
+        # Process pre-specified subgroups within this arm
+        for sg in arm.get("subgroups") or []:
+            sg_name = sg.get("subgroup_name", "Unknown subgroup")
+            sg_n = _to_int_or_none(sg.get("subgroup_n"))
+
+            for spec in specs:
+                data = sg.get(spec.key)
+                if not data or not data.get("found"):
+                    continue
+
+                unit = _normalize_unit(data.get("unit"))
+                is_rate_format = spec.plot_type == "forest" and unit == "%"
+                effective_plot_type = "bar" if is_rate_format else spec.plot_type
+                effective_key = (spec.key + "_rate") if is_rate_format else spec.key
+                effective_display = (spec.display + " (rate %)") if is_rate_format else spec.display
+                parse = _to_percent_or_none if effective_plot_type == "bar" else _to_float_or_none
+                value = parse(data.get("value"))
+                ci_lower = parse(data.get("ci_lower"))
+                ci_upper = parse(data.get("ci_upper"))
+                ci_unit = _normalize_unit(data.get("ci_unit")) or unit
+
+                rows.append({
+                    "trial_id": trial_id,
+                    "trial_label": trial_label,
+                    "paper_id": paper_id,
+                    "source_used": source_used,
+                    "arm_name": f"{arm_name} › {sg_name}",
+                    "outcome_key": effective_key,
+                    "outcome_display": effective_display,
+                    "plot_type": effective_plot_type,
+                    "value": value,
+                    "unit": unit,
+                    "ci_lower": ci_lower,
+                    "ci_upper": ci_upper,
+                    "ci_unit": ci_unit,
+                    "value_raw": data.get("value_raw") or data.get("raw"),
+                    "ci_raw": data.get("ci_raw"),
+                    "evidence": data.get("evidence", ""),
+                    "sample_size": sg_n,
+                    "plot_eligible": value is not None,
+                    "is_subgroup": True,
+                    "subgroup_name": sg_name,
+                    "subgroup_of": arm_name,
+                })
 
     return rows
 
@@ -428,7 +498,7 @@ def collect_specs_from_plot_rows(plot_rows: List[Dict[str, Any]]) -> List[Outcom
 
 def build_outcome_summary_table(per_trial_results: List[Dict[str, Any]]) -> pd.DataFrame:
     """One row per (trial, arm, outcome) for display and audit."""
-    arm_meta_fields = {"arm_name", "arm_sample_size", "arm_sample_size_raw"}
+    arm_meta_fields = {"arm_name", "arm_sample_size", "arm_sample_size_raw", "subgroups"}
     rows = []
     for item in per_trial_results:
         trial = item.get("trial", {}) or {}
@@ -453,6 +523,9 @@ def build_outcome_summary_table(per_trial_results: List[Dict[str, Any]]) -> pd.D
                     "pubmed_id": paper_id,
                     "arm_name": arm_name,
                     "arm_n": arm_n,
+                    "is_subgroup": False,
+                    "subgroup_name": None,
+                    "subgroup_n": None,
                     "outcome": key,
                     "value": data.get("value"),
                     "unit": data.get("unit"),
@@ -460,6 +533,31 @@ def build_outcome_summary_table(per_trial_results: List[Dict[str, Any]]) -> pd.D
                     "ci_upper": data.get("ci_upper"),
                     "evidence": data.get("evidence", ""),
                 })
+            # Process pre-specified subgroups
+            for sg in arm.get("subgroups") or []:
+                sg_name = sg.get("subgroup_name", "Unknown subgroup")
+                sg_n = sg.get("subgroup_n")
+                for key, data in sg.items():
+                    if key in {"subgroup_name", "subgroup_n"} or not isinstance(data, dict):
+                        continue
+                    if not data.get("found"):
+                        continue
+                    rows.append({
+                        "nct_id": nct_id,
+                        "trial_title": trial_title,
+                        "pubmed_id": paper_id,
+                        "arm_name": arm_name,
+                        "arm_n": arm_n,
+                        "is_subgroup": True,
+                        "subgroup_name": sg_name,
+                        "subgroup_n": sg_n,
+                        "outcome": key,
+                        "value": data.get("value"),
+                        "unit": data.get("unit"),
+                        "ci_lower": data.get("ci_lower"),
+                        "ci_upper": data.get("ci_upper"),
+                        "evidence": data.get("evidence", ""),
+                    })
 
     df = pd.DataFrame(rows)
     if not df.empty:

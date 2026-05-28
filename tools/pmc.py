@@ -63,15 +63,66 @@ def _safe_join_text(elements) -> str:
     return "\n\n".join(chunks)
 
 
-def parse_pmc_xml_to_text(xml_text: str) -> str:
-    """Parse PMC XML and return abstract + body as plain text."""
+_RESULTS_SECTION_TITLES = {
+    "results", "outcomes", "efficacy", "survival", "clinical outcomes",
+    "primary endpoint", "secondary endpoints", "safety and efficacy",
+    "overall survival", "progression-free survival",
+}
+
+
+def parse_pmc_xml_to_text(xml_text: str, max_chars: int = 0) -> str:
+    """
+    Parse PMC XML and return text prioritising Results/Outcomes sections.
+
+    Strategy when max_chars > 0:
+      1. Always include the abstract (usually < 500 words).
+      2. Fill remaining budget with Results/Outcomes sections first.
+      3. Append remaining body sections until budget is reached.
+    When max_chars == 0, return full text with no truncation.
+    """
     if not xml_text or not xml_text.strip():
         return ""
     try:
         root = ET.fromstring(xml_text)
         abstract_text = _safe_join_text(root.findall(".//abstract"))
-        body_text = _safe_join_text(root.findall(".//body"))
-        return "\n\n".join(x for x in [abstract_text, body_text] if x.strip()).strip()
+
+        if max_chars == 0:
+            body_text = _safe_join_text(root.findall(".//body"))
+            return "\n\n".join(x for x in [abstract_text, body_text] if x.strip()).strip()
+
+        # Collect body sections labelled by their title
+        sections: list[tuple[bool, str]] = []  # (is_results, text)
+        for sec in root.findall(".//sec"):
+            title_el = sec.find("title")
+            title = (title_el.text or "").strip().lower() if title_el is not None else ""
+            is_results = any(kw in title for kw in _RESULTS_SECTION_TITLES)
+            chunks = []
+            if title_el is not None and title_el.text:
+                chunks.append(title_el.text.strip().upper())
+            for child in sec:
+                if child.tag in ("title",):
+                    continue
+                txt = " ".join(child.itertext()).strip()
+                if txt:
+                    chunks.append(txt)
+            sec_text = "\n".join(chunks).strip()
+            if sec_text:
+                sections.append((is_results, sec_text))
+
+        # Budget: abstract first, then results sections, then rest
+        parts = [abstract_text] if abstract_text else []
+        budget = max_chars - sum(len(p) for p in parts)
+        for priority in (True, False):
+            for is_results, sec_text in sections:
+                if is_results != priority:
+                    continue
+                if budget <= 0:
+                    break
+                take = sec_text[:budget]
+                parts.append(take)
+                budget -= len(take)
+
+        return "\n\n".join(p for p in parts if p.strip()).strip()
     except Exception:
         return ""
 
@@ -79,11 +130,13 @@ def parse_pmc_xml_to_text(xml_text: str) -> str:
 def get_best_text_for_extraction(
     pubmed_record: Dict[str, Any],
     email: Optional[str] = None,
+    max_chars: int = 20_000,
 ) -> Tuple[str, str, Optional[str]]:
     """
     Return (source_text, source_used, pmcid).
     Priority: PMC full text > abstract > empty string.
     source_used is one of: 'pmc_full_text', 'abstract', 'none'.
+    Text is prioritised: abstract + Results sections fill the budget first.
     """
     pmid = str(pubmed_record.get("pubmed_id", "")).strip()
     abstract = str(pubmed_record.get("abstract", "") or "").strip()
@@ -91,11 +144,11 @@ def get_best_text_for_extraction(
     pmcid = get_pmcid_from_pmid(pmid, email=email)
     if pmcid:
         xml_text = fetch_pmc_full_text_xml(pmcid, email=email)
-        full_text = parse_pmc_xml_to_text(xml_text) if xml_text else ""
+        full_text = parse_pmc_xml_to_text(xml_text, max_chars=max_chars) if xml_text else ""
         if full_text.strip():
             return full_text, "pmc_full_text", pmcid
 
     if abstract:
-        return abstract, "abstract", pmcid
+        return abstract[:max_chars], "abstract", pmcid
 
     return "", "none", pmcid
