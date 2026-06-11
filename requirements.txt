@@ -1,6 +1,7 @@
 openai>=1.0.0
 python-dotenv>=1.0.0
 pymed>=0.8.9
+numpy>=1.24.0
 pandas>=2.0.0
 matplotlib>=3.7.0
 requests>=2.28.0
