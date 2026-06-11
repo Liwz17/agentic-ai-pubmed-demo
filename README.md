@@ -139,6 +139,29 @@ tools/
 
 ---
 
+## Recent improvements
+
+- **Paper selection step** — After finding papers, the UI shows all candidate papers per trial as a multiselect. The AI pre-selects the best match; the user can add, remove, or skip any paper before extraction runs. Each selected paper is extracted independently.
+- **Multi-paper extraction** — Multiple papers from the same trial can be extracted in a single run, each producing its own result row.
+- **Stronger arm completeness** — The extraction prompt explicitly requires all treatment arms (experimental + control + subgroups), not just the first one found.
+- **AI Plot tab** — Describe a plot in plain text; the agent generates matplotlib code, executes it in a sandboxed environment, self-reviews the rendered image, and accepts follow-up refinements.
+- **Ask tab tool calling** — The Q&A chat agent can call `plot_outcome` and `show_table` tools directly, rendering figures and dataframes in the chat.
+- **Ask tab dynamic context budget** — Paper text is capped at 300K total chars (60K per trial max), scaled by the number of papers loaded. Conversation history is trimmed oldest-first when it exceeds 40K chars.
+- **Ask tab ad-hoc plotting** — A `plot_ad_hoc` tool lets the chat agent plot arbitrary data read directly from the paper text (demographics, safety events, any table) without requiring pre-extraction. The agent extracts values itself and passes them as structured `{group, category, value, unit}` series.
+- **Ask tab dual-mode plotting** — Plot requests in the Ask tab run in standard mode (fast hardcoded charts) by default. Saying "AI plot" or describing a custom style switches to the AI Plot engine with one review/refine round.
+- **Ask tab exhaustive extraction** — The system prompt has hard constraints: report every data point in a queried section, use markdown tables for multi-variable data, quote exact paper text, never summarise with vague phrases.
+- **PDF auto-reextraction** — Uploading a PDF triggers re-extraction immediately with no button click. The file signature `(name, size)` is tracked so extraction runs exactly once per file.
+- **UI module extraction** — Ask, AI Plot, and Upload PDFs tabs moved into a dedicated `ui/` package; `app.py` is now orchestration-only.
+- **Adaptive fallback search** — Hybrid mode (which ran extra LLM calls on every trial) replaced by a smarter fallback that only fires when the NCT ID search returns nothing.
+- **Sidebar reorder** — PubMed filters moved above Outcomes for a more logical configuration flow.
+- **Inspector tiebreaker** — When the main agent and Inspector disagree on paper match, a third LLM call resolves it. The verdict is shown in the QC tab with an ⚖️ header.
+- **Extraction quality check + retry** — After the first extraction pass, a checker triggers a targeted second pass if the result looks incomplete. The retry is only adopted if it improves the result.
+- **† dagger annotation** — Data points marked with † on a plot were recovered from raw evidence text by pattern matching rather than clean LLM extraction. A figure footnote explains this.
+- **Date format normalisation** — PubMed date inputs accept both `YYYY/MM/DD` and `YYYY-MM-DD`; dashes are auto-converted.
+- **Chat history cleared on new search** — Starting a new trial search clears the Ask tab conversation so stale exchanges from a prior run are not shown.
+
+---
+
 ## Supplement — implementation notes
 
 This section documents internal design decisions for contributors.
