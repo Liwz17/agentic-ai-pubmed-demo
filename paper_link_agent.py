@@ -30,6 +30,7 @@ from prompts import (
     build_paper_link_semantic_terms_prompt,
     build_outcome_parse_prompt,
     build_outcome_extraction_prompt,
+    build_outcome_extraction_retry_prompt,
     build_primary_endpoint_identification_prompt,
     build_survival_eligibility_prompt,
     build_trial_paper_judging_prompt,
@@ -60,8 +61,6 @@ from tools import (
     PubMedFilter,
     _run_pubmed_query_once,
     build_query_A,
-    build_query_B_llm,
-    build_query_C,
     extract_trial_retrieval_fields,
     fetch_pubmed_abstract,
 )
@@ -275,6 +274,31 @@ class PaperLinkAgent(BaseAgent):
                 "reason": "Eligibility JSON parse failed; defaulting to extraction.",
             }
 
+    def _check_extraction_quality(
+        self,
+        extraction: Dict[str, Any],
+        eligibility: Dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Return (ok, issue). ok=False means a retry is warranted."""
+        arms = extraction.get("arms", [])
+        outcome_found = extraction.get("outcome_found", False)
+        paper_type = (eligibility.get("paper_type") or "").lower()
+
+        if not outcome_found:
+            return False, "outcome_found=False despite paper being eligible for extraction"
+
+        if len(arms) == 1:
+            single_arm_indicators = {"single_arm", "single-arm", "phase 1", "phase_1", "phase i"}
+            is_likely_single_arm = any(t in paper_type for t in single_arm_indicators)
+            if not is_likely_single_arm:
+                arm_name = arms[0].get("arm_name", "unknown")
+                return False, (
+                    f"Only 1 arm ('{arm_name}') extracted but paper_type='{paper_type}' "
+                    f"suggests a multi-arm trial — control/comparator arm may be missing"
+                )
+
+        return True, ""
+
     def extract_outcomes_from_text(
         self,
         pubmed_record: Dict[str, Any],
@@ -330,50 +354,24 @@ class PaperLinkAgent(BaseAgent):
     # Non-LLM retrieval — delegates to tools/linker utilities
     # ------------------------------------------------------------------
 
-    def _retrieve_candidates(
-        self,
-        fields: Dict[str, Any],
-        semantic_terms: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    def _retrieve_candidates(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Run PubMed queries A / B / C and return deduplicated candidates.
-        Query B is only built in hybrid mode and uses the LLM-generated terms.
+        Run Query A (NCT ID search) and return deduplicated candidates.
+        If Query A returns nothing, _fallback_search is called by find_papers_for_trial.
         """
-        papers_A, papers_B, papers_C = [], [], []
-        query_A = query_B = query_C = None
-
-        query_A = build_query_A(fields, pubmed_filter=self.pubmed_filter)
+        query_A = build_query_A(fields)
+        papers_A = []
         if query_A:
             print(f"  [Query A] {query_A}")
             papers_A = _run_pubmed_query_once(
                 query_A, max_papers=self.max_papers_per_query
             )
 
-        if self.mode == "hybrid":
-            query_B = build_query_B_llm(
-                fields, semantic_terms, pubmed_filter=self.pubmed_filter
-            )
-            print(f"  [Query B] {query_B}")
-            papers_B = _run_pubmed_query_once(
-                query_B, max_papers=self.max_papers_per_query
-            )
-
-            query_C = build_query_C(fields, pubmed_filter=self.pubmed_filter)
-            print(f"  [Query C] {query_C}")
-            papers_C = _run_pubmed_query_once(
-                query_C, max_papers=self.max_papers_per_query
-            )
-
-        all_candidates = dedup_papers_by_pmid(papers_A + papers_B + papers_C)
-
         return {
             "query_A": query_A,
-            "query_B": query_B,
-            "query_C": query_C,
             "papers_A": papers_A,
-            "papers_B": papers_B,
-            "papers_C": papers_C,
-            "all_candidates": all_candidates,
+            "all_candidates": dedup_papers_by_pmid(papers_A),
+            "fallback_used": False,
         }
 
     # ------------------------------------------------------------------
@@ -495,6 +493,50 @@ class PaperLinkAgent(BaseAgent):
                 "survival_extraction": empty_extraction,
             }
 
+        # Quality check — retry once with a targeted prompt if issues are detected
+        ok, issue = self._check_extraction_quality(extraction, eligibility)
+        if not ok:
+            print(f"  [quality check] Issue: {issue}. Retrying with targeted prompt…")
+            try:
+                retry_prompt = build_outcome_extraction_retry_prompt(
+                    pubmed_record, source_text[:self.max_text_chars], source_used,
+                    extraction_specs or self.outcome_specs or [],
+                    previous_extraction=extraction,
+                    issue=issue,
+                    pmcid=pmcid,
+                )
+                response = self._call_chat_model(user_message=retry_prompt)
+                content = self._clean_json(response.choices[0].message.content or "")
+                retry_result = _try_parse_json(content)
+                if retry_result:
+                    retry_result.setdefault("source_used", source_used)
+                    retry_result["pmcid"] = pmcid
+                    retry_result.setdefault("arms", [])
+                    arm_meta = {"arm_name", "arm_sample_size", "arm_sample_size_raw", "subgroups"}
+                    retry_result["outcome_found"] = any(
+                        isinstance(v, dict) and v.get("found")
+                        for arm in retry_result["arms"]
+                        for k, v in arm.items()
+                        if k not in arm_meta
+                    )
+                    retry_result["plot_rows"] = build_multi_outcome_plot_rows(
+                        retry_result, extraction_specs or self.outcome_specs or [],
+                        trial_id=trial_id, trial_label=trial_label,
+                    )
+                    retry_result["retry_triggered"] = True
+                    retry_result["retry_reason"] = issue
+                    # Only use retry if it improved the result
+                    if (retry_result.get("outcome_found") and not extraction.get("outcome_found")) \
+                            or len(retry_result.get("arms", [])) > len(extraction.get("arms", [])):
+                        print(f"  [quality check] Retry improved result — using retry extraction.")
+                        extraction = retry_result
+                    else:
+                        print(f"  [quality check] Retry did not improve result — keeping original.")
+                        extraction["retry_triggered"] = True
+                        extraction["retry_reason"] = issue
+            except Exception as retry_exc:
+                print(f"  [quality check] Retry failed: {retry_exc}")
+
         if extraction.get("source_used") == "abstract":
             extraction = self._try_pdf_fallback(
                 extraction, pubmed_record, pubmed_id, trial_id, trial_label
@@ -562,6 +604,57 @@ class PaperLinkAgent(BaseAgent):
             )
         return extraction
 
+    def _fallback_search(self, fields: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Two-level fallback when all standard queries return zero candidates.
+        Level 1: drug(s) + disease + clinical trial filter.
+        Level 2: drug(s) only + clinical trial filter (drops disease/phase if too restrictive).
+
+        require_clinical_trial is set to True only when the user has not already specified
+        publication types — if they have, their filter handles pub type and adding a
+        hardcoded Clinical Trial clause would create a conflicting AND.
+        """
+        from tools.pubmed_trials import build_structured_pubmed_query
+
+        disease = fields.get("disease") or ""
+        drugs = [d for d in (fields.get("drugs") or []) if d]
+        phase = fields.get("phase")
+
+        if not drugs and not disease:
+            return []
+
+        # Only add the hardcoded clinical trial clause when the user hasn't set pub types
+        user_set_pub_types = bool(
+            self.pubmed_filter and self.pubmed_filter.publication_types
+        )
+        require_ct = not user_set_pub_types
+
+        # Level 1: drug + disease + phase
+        if drugs and disease:
+            q1 = build_structured_pubmed_query(
+                disease=disease, drugs=drugs, phase=phase,
+                require_clinical_trial=require_ct,
+                pubmed_filter=self.pubmed_filter,
+            )
+            print(f"  [Fallback L1] {q1}")
+            results = _run_pubmed_query_once(q1, max_papers=self.max_papers_per_query)
+            if results:
+                return dedup_papers_by_pmid(results)
+
+        # Level 2: drug only (drop disease and phase to widen the net)
+        if drugs:
+            q2 = build_structured_pubmed_query(
+                drugs=drugs,
+                require_clinical_trial=require_ct,
+                pubmed_filter=self.pubmed_filter,
+            )
+            print(f"  [Fallback L2] {q2}")
+            results = _run_pubmed_query_once(q2, max_papers=self.max_papers_per_query)
+            if results:
+                return dedup_papers_by_pmid(results)
+
+        return []
+
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
@@ -578,16 +671,19 @@ class PaperLinkAgent(BaseAgent):
         print(f"\n[PaperLinkAgent] Finding papers for trial {idx}...")
 
         fields = extract_trial_retrieval_fields(trial_row)
-        semantic_terms = self.get_semantic_terms(fields)
-        retrieval = self._retrieve_candidates(fields, semantic_terms)
+        retrieval = self._retrieve_candidates(fields)
         all_candidates = retrieval["all_candidates"]
-        print(
-            f"  Candidates: "
-            f"A={len(retrieval['papers_A'])} "
-            f"B={len(retrieval['papers_B'])} "
-            f"C={len(retrieval['papers_C'])} "
-            f"unique={len(all_candidates)}"
-        )
+        print(f"  Candidates (Query A): {len(retrieval['papers_A'])} unique={len(all_candidates)}")
+
+        # Adaptive fallback when Query A returned nothing
+        if not all_candidates:
+            print(f"  No candidates found — trying fallback search…")
+            fallback_candidates = self._fallback_search(fields)
+            if fallback_candidates:
+                print(f"  Fallback found {len(fallback_candidates)} candidate(s).")
+                all_candidates = fallback_candidates
+                retrieval["all_candidates"] = fallback_candidates
+            retrieval["fallback_used"] = bool(fallback_candidates)
 
         judge_result = self.judge_trial_papers(fields, all_candidates)
         print(
@@ -596,19 +692,14 @@ class PaperLinkAgent(BaseAgent):
         )
 
         link_result = {
-            "mode": self.mode,
             "trial_fields": fields,
-            "semantic_terms": semantic_terms,
             "query_A": retrieval["query_A"],
-            "query_B": retrieval["query_B"],
-            "query_C": retrieval["query_C"],
             "papers_A": retrieval["papers_A"],
-            "papers_B": retrieval["papers_B"],
-            "papers_C": retrieval["papers_C"],
+            "fallback_used": retrieval.get("fallback_used", False),
             "all_candidates": all_candidates,
             "judge_result": judge_result,
         }
-        return {"trial": trial_row, "semantic_terms": semantic_terms, "link_result": link_result}
+        return {"trial": trial_row, "link_result": link_result}
 
     def extract_for_trial(
         self,
@@ -662,18 +753,18 @@ class PaperLinkAgent(BaseAgent):
         print(f"\n[PaperLinkAgent] Processing trial {idx}...")
 
         fields = extract_trial_retrieval_fields(trial_row)
-
-        semantic_terms = self.get_semantic_terms(fields)
-
-        retrieval = self._retrieve_candidates(fields, semantic_terms)
+        retrieval = self._retrieve_candidates(fields)
         all_candidates = retrieval["all_candidates"]
-        print(
-            f"  Candidates: "
-            f"A={len(retrieval['papers_A'])} "
-            f"B={len(retrieval['papers_B'])} "
-            f"C={len(retrieval['papers_C'])} "
-            f"unique={len(all_candidates)}"
-        )
+        print(f"  Candidates (Query A): {len(retrieval['papers_A'])} unique={len(all_candidates)}")
+
+        if not all_candidates:
+            print(f"  No candidates found — trying fallback search…")
+            fallback_candidates = self._fallback_search(fields)
+            if fallback_candidates:
+                print(f"  Fallback found {len(fallback_candidates)} candidate(s).")
+                all_candidates = fallback_candidates
+                retrieval["all_candidates"] = fallback_candidates
+            retrieval["fallback_used"] = bool(fallback_candidates)
 
         judge_result = self.judge_trial_papers(fields, all_candidates)
         print(
@@ -681,17 +772,11 @@ class PaperLinkAgent(BaseAgent):
             f"PMID: {judge_result.get('selected_pubmed_id')}"
         )
 
-        # build link_result in the same shape as the legacy pipeline
         link_result = {
-            "mode": self.mode,
             "trial_fields": fields,
-            "semantic_terms": semantic_terms,
             "query_A": retrieval["query_A"],
-            "query_B": retrieval["query_B"],
-            "query_C": retrieval["query_C"],
             "papers_A": retrieval["papers_A"],
-            "papers_B": retrieval["papers_B"],
-            "papers_C": retrieval["papers_C"],
+            "fallback_used": retrieval.get("fallback_used", False),
             "all_candidates": all_candidates,
             "judge_result": judge_result,
         }
@@ -701,7 +786,6 @@ class PaperLinkAgent(BaseAgent):
 
         return {
             "trial": trial_row,
-            "semantic_terms": semantic_terms,
             "link_result": link_result,
             "survival_result": survival_result,
             "plot_rows": plot_rows,

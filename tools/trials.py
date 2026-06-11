@@ -44,12 +44,12 @@ def _normalize_trial_record(study: Dict[str, Any]) -> Dict[str, Any]:
 
     phases = _safe_get(protocol, ["designModule", "phases"], default=[]) or []
     overall_status = _safe_get(protocol, ["statusModule", "overallStatus"])
-    start_date = _safe_get(
-        protocol, ["statusModule", "startDateStruct", "date"]
-    )
-    completion_date = _safe_get(
-        protocol, ["statusModule", "completionDateStruct", "date"]
-    )
+    start_date = _safe_get(protocol, ["statusModule", "startDateStruct", "date"])
+    primary_completion_date = _safe_get(protocol, ["statusModule", "primaryCompletionDateStruct", "date"])
+    completion_date = _safe_get(protocol, ["statusModule", "completionDateStruct", "date"])
+    results_first_posted_date = _safe_get(protocol, ["statusModule", "resultsFirstPostDateStruct", "date"])
+    first_posted_date = _safe_get(protocol, ["statusModule", "studyFirstPostDateStruct", "date"])
+    last_update_posted_date = _safe_get(protocol, ["statusModule", "lastUpdatePostDateStruct", "date"])
     sponsor = _safe_get(protocol, ["contactsLocationsModule", "centralContacts"], default=[])
     brief_summary = _safe_get(protocol, ["descriptionModule", "briefSummary"])
 
@@ -62,7 +62,11 @@ def _normalize_trial_record(study: Dict[str, Any]) -> Dict[str, Any]:
         "phases": phases,
         "overall_status": overall_status,
         "start_date": start_date,
+        "primary_completion_date": primary_completion_date,
         "completion_date": completion_date,
+        "results_first_posted_date": results_first_posted_date,
+        "first_posted_date": first_posted_date,
+        "last_update_posted_date": last_update_posted_date,
         "sponsor": sponsor,
         "brief_summary": brief_summary,
     }
@@ -112,21 +116,15 @@ def _fetch_studies_one_term(
 
     return studies
 
-def _contains_all_drugs(drug_field, target_drugs):
-    """
-    Check whether drug_field contains ALL drugs in target_drugs.
-    drug_field may be a list or string.
-    """
-
-    if not target_drugs:
-        return True
-
-    if isinstance(drug_field, list):
-        text = " ".join([str(x).lower() for x in drug_field])
-    else:
-        text = str(drug_field).lower()
-
-    return all(drug.lower() in text for drug in target_drugs)
+# Mapping from UI/query date_field value → DataFrame column name
+_DATE_FIELD_COL = {
+    "start_date":                "start_date",
+    "primary_completion_date":   "primary_completion_date",
+    "completion_date":           "completion_date",
+    "results_first_posted_date": "results_first_posted_date",
+    "first_posted_date":         "first_posted_date",
+    "last_update_posted_date":   "last_update_posted_date",
+}
 
 # search trials from .gov based on structured query
 def search_clinical_trials(query: Dict[str, Any]) -> pd.DataFrame:
@@ -187,28 +185,22 @@ def search_clinical_trials(query: Dict[str, Any]) -> pd.DataFrame:
         )
     ].copy()
 
-    df["start_date_dt"] = pd.to_datetime(df["start_date"], errors="coerce")
+    # Resolve which date field to filter on (default: study start date)
+    date_field = query.get("date_field", "start_date")
+    date_col = _DATE_FIELD_COL.get(date_field, "start_date")
+
+    df[f"{date_col}_dt"] = pd.to_datetime(df[date_col], errors="coerce")
+    filter_col = f"{date_col}_dt"
+
     start_dt = pd.to_datetime(query["start_date"])
     end_dt = pd.to_datetime(query["end_date"])
 
     df = df[
-        (df["start_date_dt"] >= start_dt) &
-        (df["start_date_dt"] <= end_dt)
+        (df[filter_col] >= start_dt) &
+        (df[filter_col] <= end_dt)
     ].copy()
 
-    # # --- Local filter: drugs (AND logic: must contain ALL drugs) ---
-    # target_drugs = query.get("drugs", [])
-
-    # if target_drugs:
-    #     df = df[
-    #         df["interventions"].apply(lambda x: _contains_all_drugs(x, target_drugs))
-    #     ].copy()
-
-    # print("columns before sort:", df.columns.tolist())
-    # print(df.head())
-
-    # Optional: sort by first posted date
-    df = df.sort_values(by="start_date_dt").reset_index(drop=True)
+    df = df.sort_values(by=filter_col).reset_index(drop=True)
 
     return df
 

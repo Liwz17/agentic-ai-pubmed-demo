@@ -95,7 +95,9 @@ class TrialRetrievalAgent(BaseAgent):
     # Non-LLM steps — delegates to tools
     # ------------------------------------------------------------------
 
-    def _search_trials(self, structured_query: Dict[str, Any]) -> pd.DataFrame:
+    def _search_trials(self, structured_query: Dict[str, Any], date_field: str = "start_date") -> pd.DataFrame:
+        structured_query = dict(structured_query)
+        structured_query["date_field"] = date_field
         return search_clinical_trials(structured_query)
 
     def _select_trials_interactive(self, df_trials: pd.DataFrame) -> List[int]:
@@ -130,20 +132,25 @@ class TrialRetrievalAgent(BaseAgent):
     # Orchestration
     # ------------------------------------------------------------------
 
-    def run(self, user_input: str) -> Dict[str, Any]:
+    def run(self, user_input: str, date_field: str = "start_date") -> Dict[str, Any]:
         """
         End-to-end flow:
           1. Parse user request into structured query  (LLM)
           2. Search ClinicalTrials.gov
           3. Select relevant trials (interactive or auto)
+
+        date_field: which ClinicalTrials.gov date to filter on.
+          "start_date" | "primary_completion_date" | "completion_date"
+          | "results_first_posted_date" | "first_posted_date"
         """
         self.clear()  # each run is independent — reset conversation history
         print("\n[TrialRetrievalAgent] Parsing query...")
         structured_query = self.parse_query(user_input)
         print(f"  {structured_query}")
+        print(f"  Date field: {date_field}")
 
         print("\n[TrialRetrievalAgent] Searching trials...")
-        df_trials = self._search_trials(structured_query)
+        df_trials = self._search_trials(structured_query, date_field=date_field)
 
         if df_trials.empty:
             return {

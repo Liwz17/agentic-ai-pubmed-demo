@@ -659,6 +659,14 @@ Rules:
    extract the percentage as value, unit="%", and include the timepoint in value_raw.
    Never return value=null when any numeric result is present in the text.
 9. Output JSON only — no markdown, no explanation.
+10. ARMS vs SUBGROUPS — use the correct level:
+    - Place a group in `arms[]` if patients were ASSIGNED to that group (treatment arm, control arm,
+      dose cohort, combination cohort). Each arm in a randomized trial is a separate `arms[]` entry.
+    - Place data in `arm.subgroups[]` ONLY if it is a PRE-SPECIFIED subset of patients WITHIN an arm,
+      defined by a biomarker, mutation, or demographic characteristic and reported as a secondary
+      (subgroup) analysis. Examples: PD-L1 ≥1%, EGFR-mutant, Asian subpopulation, male patients.
+    - Do NOT put dose levels, combination regimens, or separate cohorts as subgroups — those are arms.
+    - If in doubt, use `arms[]`, not `subgroups[]`.
 
 Return ONLY JSON in this format:
 {{
@@ -768,6 +776,50 @@ def build_plot_row_summary_prompt(
     )
 
 
+def build_outcome_extraction_retry_prompt(
+    pubmed_record: Dict[str, Any],
+    source_text: str,
+    source_used: str,
+    specs: List[Any],
+    previous_extraction: Dict[str, Any],
+    issue: str,
+    pmcid: Optional[str] = None,
+) -> str:
+    """
+    Retry extraction prompt — includes the first-pass result and the specific issue
+    so the agent knows exactly what to fix on the second pass.
+    """
+    arms_found = [a.get("arm_name", "?") for a in previous_extraction.get("arms", [])]
+    prev_notes = previous_extraction.get("notes", "")
+    base_prompt = build_outcome_extraction_prompt(
+        pubmed_record, source_text, source_used, specs, pmcid=pmcid
+    )
+    preamble = f"""⚠️  QUALITY-CHECK RETRY — a first-pass extraction was attempted but a problem was detected.
+
+Issue detected: {issue}
+
+First-pass result:
+- Arms found: {arms_found if arms_found else "none"}
+- outcome_found: {previous_extraction.get("outcome_found")}
+- Notes: {prev_notes or "(none)"}
+
+Instructions for this retry:
+1. Re-read the FULL text carefully, especially the Methods (arm definitions) and Results sections.
+2. {
+    "Look harder for ALL treatment arms — check for a control/placebo/SOC arm that may have been missed. "
+    "Multi-arm trials always have at least one experimental and one comparator arm. "
+    "Scan every table and paragraph in Results for arm-level data."
+    if "arm" in issue.lower() else
+    "The previous pass reported outcome_found=False. Search the Results section thoroughly — "
+    "the outcome may be reported in a table, figure legend, or as a secondary endpoint. "
+    "If only a survival rate at a timepoint is available (e.g. '12-month OS 62%'), extract that."
+}
+3. Do not repeat the same result — if you still cannot find data, explain specifically why in notes.
+
+"""
+    return preamble + base_prompt
+
+
 # ---------------------------------------------------------------------------
 # InspectorAgent task prompts
 # ---------------------------------------------------------------------------
@@ -776,6 +828,55 @@ INSPECTOR_PROMPTS: Dict[str, str] = {
     "judge_trial_papers": LINKING_TASK_PROMPTS["judge_trial_papers"],
     "judge_survival_plot_eligibility": SURVIVAL_TASK_PROMPTS["judge_survival_plot_eligibility"],
 }
+
+
+def build_inspector_tiebreak_prompt(
+    trial_fields: Dict[str, Any],
+    papers_text: str,
+    agent_verdict: Dict[str, Any],
+    inspector_verdict: Dict[str, Any],
+) -> str:
+    return f"""You are a senior biomedical literature reviewer acting as a TIEBREAKER.
+
+Two agents reached different conclusions about whether a candidate paper matches this trial.
+Your job is to read both verdicts and the trial/paper details, then issue a definitive final verdict.
+
+Trial:
+- NCT ID: {trial_fields.get("nct_id")}
+- Title: {trial_fields.get("brief_title")}
+- Disease: {trial_fields.get("disease")}
+- Drugs: {trial_fields.get("drugs")}
+- Phase: {trial_fields.get("phase")}
+
+Candidate papers:
+{papers_text}
+
+Agent A verdict:
+- match_found: {agent_verdict.get("match_found")}
+- confidence: {agent_verdict.get("confidence")}
+- reason: {agent_verdict.get("reason")}
+
+Agent B (Inspector) verdict:
+- match_found: {inspector_verdict.get("match_found")}
+- confidence: {inspector_verdict.get("confidence")}
+- reason: {inspector_verdict.get("reason")}
+
+Task:
+Review the evidence and issue a final, definitive verdict. Favour the agent with stronger
+evidence (e.g. explicit NCT ID match, drug name match, matching phase and disease).
+If both agents are speculating, prefer the more conservative verdict (no match).
+
+Return ONLY JSON in this format:
+{{
+  "match_found": true,
+  "selected_pubmed_id": "12345678",
+  "selected_title": "paper title",
+  "label": "primary_results",
+  "confidence": "high",
+  "reason": "tiebreaker reasoning",
+  "tiebreak": true
+}}
+""".strip()
 
 
 def build_inspector_trial_paper_judging_prompt(

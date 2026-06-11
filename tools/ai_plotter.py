@@ -311,6 +311,28 @@ class AIPlotterAgent(BaseAgent):
         match = re.search(r"```python\s*(.*?)```", content, re.DOTALL)
         return match.group(1).strip() if match else content.strip()
 
+    def fix_adhoc_code(self, code: str, error: str, series_literal: str = "") -> str:
+        """Fix a runtime error in ad-hoc plot code (uses `series`, not `plot_rows`)."""
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+        data_note = f"Available data:\nseries = {series_literal[:600]}\n\n" if series_literal else ""
+        prompt = (
+            f"This matplotlib code raised a runtime error in the sandbox:\n\n"
+            f"Error:\n```\n{error}\n```\n\n"
+            f"{data_note}"
+            f"Rules:\n"
+            f"- NO import statements. Pre-injected globals: plt, np, pd, re, textwrap, series.\n"
+            f"- `series` is a list of dicts with keys: group (str), category (str), value (float), unit (str).\n"
+            f"- Do NOT reference plot_rows or plot_eligible — they are not available in this sandbox.\n"
+            f"- NEVER raise exceptions. Empty data -> draw ax.text(0.5,0.5,'No data',transform=ax.transAxes).\n"
+            f"- Guard division: `if not groups: ... else: w = 0.7/len(groups)`.\n\n"
+            f"Broken code:\n```python\n{code}\n```\n\n"
+            f"Return ONLY the complete corrected Python code block."
+        )
+        resp = self._call_chat_model(user_message=prompt, temperature=0.2)
+        content = resp.choices[0].message.content or ""
+        match = re.search(r"```python\s*(.*?)```", content, re.DOTALL)
+        return match.group(1).strip() if match else content.strip()
+
     def refine_code(
         self,
         current_code: str,

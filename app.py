@@ -6,11 +6,6 @@ Run with:
 """
 
 import io
-import json
-import base64
-import tempfile
-import os
-from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend — must be set before pyplot import
@@ -30,6 +25,9 @@ from tools.outcomes import (
     draw_outcome_bar_chart,
     DEFAULT_OUTCOME_SPECS,
 )
+from ui.ask_tab import render_ask_tab
+from ui.ai_plot_tab import render_ai_plot_tab
+from ui.pdf_tab import render_pdf_tab
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -42,274 +40,28 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Chat tool definitions
-# ---------------------------------------------------------------------------
-
-CHAT_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "plot_outcome",
-            "description": (
-                "Plot extracted outcome data as a forest or bar chart. "
-                "Use when the user asks to visualise, chart, or plot specific outcomes, trials, or arms."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "outcome_key": {
-                        "type": "string",
-                        "description": (
-                            "Snake-case outcome key, e.g. 'overall_survival', "
-                            "'progression_free_survival', 'objective_response_rate'. "
-                            "Omit or set to null to plot all available outcomes."
-                        ),
-                    },
-                    "trial_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "NCT IDs to include. Omit or set to null for all trials.",
-                    },
-                    "arm_names": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Arm names to include. Omit or set to null for all arms.",
-                    },
-                    "plot_type": {
-                        "type": "string",
-                        "enum": ["forest", "bar", "auto"],
-                        "description": "'forest', 'bar', or 'auto' (let the spec decide). Default 'auto'.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "show_table",
-            "description": (
-                "Show a summary table of extracted outcomes. "
-                "Use when the user asks for a table, summary, or spreadsheet view."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "trial_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "NCT IDs to include. Omit or set to null for all trials.",
-                    },
-                    "outcome_keys": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Outcome keys to include. Omit or set to null for all outcomes.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-]
-
-
-# ---------------------------------------------------------------------------
-# Chat tool execution helpers
-# ---------------------------------------------------------------------------
-
-def _execute_plot_outcome(args: dict, pr: dict):
-    """
-    Filter plot rows according to tool args and draw the requested figure.
-    Returns a matplotlib Figure or None if nothing matches.
-    """
-    outcome_key = args.get("outcome_key") or None
-    trial_ids = args.get("trial_ids") or None
-    arm_names = args.get("arm_names") or None
-    plot_type_override = args.get("plot_type") or "auto"
-
-    all_rows = pr.get("all_plot_rows", [])
-    specs = pr.get("specs", [])
-
-    # Filter to eligible rows first
-    rows = [r for r in all_rows if r.get("plot_eligible")]
-
-    if outcome_key:
-        rows = [r for r in rows if r.get("outcome_key") == outcome_key]
-    if trial_ids:
-        tids_lower = [t.lower() for t in trial_ids]
-        rows = [r for r in rows if (r.get("trial_id") or "").lower() in tids_lower]
-    if arm_names:
-        arms_lower = [a.lower() for a in arm_names]
-        rows = [r for r in rows if (r.get("arm_name") or "").lower() in arms_lower]
-
-    if not rows:
-        return None
-
-    # Determine which outcome keys are present
-    keys_present = list(dict.fromkeys(r["outcome_key"] for r in rows))
-    spec_map = {s.key: s for s in specs}
-
-    figs = []
-    for key in keys_present:
-        key_rows = [r for r in rows if r["outcome_key"] == key]
-        spec = spec_map.get(key)
-        if spec is None:
-            continue
-
-        # Resolve plot type
-        if plot_type_override == "forest" or (plot_type_override == "auto" and spec.plot_type == "forest"):
-            fig, _ = draw_outcome_forest_plot(key_rows, spec, show=False)
-        elif plot_type_override == "bar" or (plot_type_override == "auto" and spec.plot_type == "bar"):
-            fig, _ = draw_outcome_bar_chart(key_rows, spec, show=False)
-        else:
-            fig = None
-
-        if fig:
-            figs.append(fig)
-
-    # Return single fig or the first one (caller can iterate for multi-outcome)
-    return figs if figs else None
-
-
-def _execute_show_table(args: dict, pr: dict):
-    """
-    Build the outcome summary table and optionally filter by trial_ids / outcome_keys.
-    Returns a DataFrame or None.
-    """
-    trial_ids = args.get("trial_ids") or None
-    outcome_keys = args.get("outcome_keys") or None
-
-    per_trial_results = pr.get("per_trial_results", [])
-    df = build_outcome_summary_table(per_trial_results)
-
-    if df is None or df.empty:
-        return df
-
-    if trial_ids:
-        tids_lower = [t.lower() for t in trial_ids]
-        # The summary table has a column for trial/NCT ID — find it
-        nct_col = next(
-            (c for c in df.columns if "nct" in c.lower() or "trial" in c.lower()),
-            None,
-        )
-        if nct_col:
-            df = df[df[nct_col].str.lower().isin(tids_lower)]
-
-    if outcome_keys:
-        # Filter columns: keep identifier columns + any column matching an outcome key
-        id_cols = [c for c in df.columns if not any(ok in c.lower() for ok in outcome_keys)]
-        outcome_cols = [c for c in df.columns if any(ok in c.lower() for ok in outcome_keys)]
-        keep = id_cols[:2] + outcome_cols  # keep a couple of ID cols + matched outcome cols
-        df = df[[c for c in keep if c in df.columns]]
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _fetch_pmc_pdf_bytes(pmcid: str) -> Optional[bytes]:
-    """Try to download the open-access PDF for a PMC article. Returns None on failure."""
-    import requests
-    numeric = str(pmcid).replace("PMC", "").strip()
-    url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{numeric}/pdf/"
-    try:
-        resp = requests.get(
-            url, timeout=30, allow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; research-tool/1.0)"},
-        )
-        if resp.status_code == 200 and resp.content[:4] == b"%PDF":
-            return resp.content
-    except Exception:
-        pass
-    return None
-
-
-_CHAT_TEXT_LIMIT = 15000  # chars of paper text per trial passed to the chat agent
-
-def _build_chat_context(per_trial_results: list) -> str:
-    lines = [
-        "You are a research assistant helping a user review clinical trial literature extraction results.",
-        "For each trial you have the full paper text that was used for extraction, plus extraction metadata.",
-        "Answer questions by reading the paper text directly. Be precise and quote from the text when relevant.",
-        "If the answer cannot be determined from the available text, say so clearly.",
-        "",
-        "You have two tools available:",
-        "- plot_outcome: call this whenever the user asks to visualise, chart, plot, or graph outcomes.",
-        "- show_table: call this whenever the user asks for a table, summary, or spreadsheet view of outcomes.",
-        "Prefer calling a tool over describing data in prose when the user's intent is clearly visual.",
-        "",
-    ]
-    for item in per_trial_results:
-        trial = item.get("trial", {}) or {}
-        sr = item.get("survival_result", {}) or {}
-        ex = sr.get("survival_extraction", {}) or {}
-        lr = item.get("link_result", {}) or {}
-        jr = lr.get("judge_result", {}) or {}
-        source_text = sr.get("source_text") or ""
-
-        nct = trial.get("nct_id", "unknown")
-        pmid = jr.get("selected_pubmed_id", "unknown")
-        source_used = ex.get("source_used", "unknown")
-
-        lines.append(f"{'='*60}")
-        lines.append(f"Trial: {nct} — {(trial.get('brief_title') or '')[:120]}")
-        lines.append(f"Paper: PMID {pmid} | source_used={source_used} | outcome_found={ex.get('outcome_found')}")
-        lines.append(f"Extraction notes: {ex.get('notes', '(none)')}")
-        arms_found = [a.get('arm_name') for a in ex.get('arms', [])]
-        lines.append(f"Arms extracted: {arms_found if arms_found else 'none'}")
-        lines.append("")
-        if source_text.strip():
-            lines.append("--- Paper text (used for extraction) ---")
-            lines.append(source_text[:_CHAT_TEXT_LIMIT])
-            if len(source_text) > _CHAT_TEXT_LIMIT:
-                lines.append(f"[... text truncated at {_CHAT_TEXT_LIMIT} chars ...]")
-        else:
-            lines.append("--- Paper text: not available ---")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def _merge_extractions(old_ex: dict, new_ex: dict) -> dict:
-    """
-    Merge PDF re-extraction (new_ex) with the previous extraction (old_ex).
-    Arms in new_ex take priority; arms in old_ex that have no name match in
-    new_ex are appended so previously found data is never silently discarded.
-    """
-    new_names = {
-        (a.get("arm_name") or "").strip().lower()
-        for a in new_ex.get("arms", [])
-    }
-    kept_old = [
-        a for a in old_ex.get("arms", [])
-        if (a.get("arm_name") or "").strip().lower() not in new_names
-    ]
-    merged = dict(new_ex)
-    merged["arms"] = new_ex.get("arms", []) + kept_old
-    if kept_old:
-        merged["notes"] = (
-            (new_ex.get("notes") or "") +
-            f" | {len(kept_old)} arm(s) retained from prior extraction: "
-            + ", ".join(a.get("arm_name", "?") for a in kept_old)
-        ).strip(" |")
-    return merged
-
-
-# ---------------------------------------------------------------------------
 # Sidebar — configuration
 # ---------------------------------------------------------------------------
 
+_DATE_FIELD_LABELS = [
+    "Study Start Date",
+    "Primary Completion Date",
+    "Study Completion Date",
+    "Results First Posted Date",
+    "First Posted Date",
+    "Last Update Posted Date",
+]
+_DATE_FIELD_KEYS = {
+    "Study Start Date":          "start_date",
+    "Primary Completion Date":   "primary_completion_date",
+    "Study Completion Date":     "completion_date",
+    "Results First Posted Date": "results_first_posted_date",
+    "First Posted Date":         "first_posted_date",
+    "Last Update Posted Date":   "last_update_posted_date",
+}
+
 with st.sidebar:
     st.header("Configuration")
-
-    pubmed_mode = st.selectbox(
-        "PubMed search mode",
-        ["nct_only", "hybrid"],
-        help="nct_only: NCT ID only (fast, precise). hybrid: NCT ID + LLM semantic terms + structured fields.",
-    )
 
     trial_selection_mode = st.radio(
         "Trial selection mode",
@@ -321,17 +73,57 @@ with st.sidebar:
     max_papers = st.slider("Max papers per query", 3, 20, 5)
 
     st.divider()
+    st.subheader("Trial date field")
+    st.caption(
+        "When your query includes a year range (e.g. '2018–2022'), this controls "
+        "which ClinicalTrials.gov date is compared against that range."
+    )
+    date_field_label = st.radio(
+        "Filter trials by",
+        _DATE_FIELD_LABELS,
+        index=0,
+        help=(
+            "Study Start Date — when the trial began enrolling (default).  \n"
+            "Primary Completion Date — when primary endpoint data collection ended.  \n"
+            "Study Completion Date — when all data collection ended.  \n"
+            "Results First Posted Date — when results were first posted on ClinicalTrials.gov.  \n"
+            "First Posted Date — when the trial record was first registered.  \n"
+            "Last Update Posted Date — when the trial record was last updated."
+        ),
+    )
+    date_field = _DATE_FIELD_KEYS[date_field_label]
+
+    st.divider()
     st.subheader("PubMed filters (optional)")
+    st.caption(
+        "These filters apply to **fallback keyword search only** — when the NCT ID lookup "
+        "finds no papers, the pipeline falls back to a drug + disease keyword query and "
+        "applies these filters to narrow results. The primary NCT ID search always runs "
+        "unfiltered so a valid paper is never missed due to date or type restrictions."
+    )
     col1, col2 = st.columns(2)
     with col1:
-        pub_date_start = st.text_input("Date start", placeholder="YYYY/MM/DD")
+        pub_date_start = st.text_input(
+            "Published from", placeholder="YYYY/MM/DD",
+            help=(
+                "Earliest **paper publication date** to include in fallback results "
+                "(YYYY/MM/DD or YYYY-MM-DD). Not the trial start date."
+            ),
+        )
     with col2:
-        pub_date_end = st.text_input("Date end", placeholder="YYYY/MM/DD")
+        pub_date_end = st.text_input(
+            "Published to", placeholder="YYYY/MM/DD",
+            help=(
+                "Latest **paper publication date** to include in fallback results "
+                "(YYYY/MM/DD or YYYY-MM-DD). Not the trial end date."
+            ),
+        )
 
     pub_types = st.multiselect(
         "Publication types",
         ["clinical_trial", "rct", "meta_analysis", "systematic_review", "final_report"],
         default=[],
+        help="Restricts fallback keyword results to the selected publication types. Has no effect when NCT ID search succeeds.",
     )
 
     st.divider()
@@ -348,16 +140,23 @@ with st.sidebar:
 
 def _reset_downstream(keep_trials: bool = False):
     for key in ["paper_results", "inspection_results", "figures", "custom_fig", "custom_fig_name",
-                "paper_finding_results", "paper_agent_config"]:
+                "paper_finding_results", "paper_agent_config", "chat_history", "unit_logs",
+                "ai_plot_code", "ai_plot_fig_b64", "ai_plot_review", "ai_plot_figs",
+                "ai_plotter", "ai_plot_default_figs", "ai_plot_approved", "ai_plot_rows"]:
         st.session_state.pop(key, None)
     if not keep_trials:
         st.session_state.pop("trial_packet", None)
         st.session_state.pop("selected_indices", None)
 
 
+def _normalize_pubmed_date(raw: str) -> str:
+    """Normalize date to YYYY/MM/DD (PubMed format). Accepts YYYY-MM-DD or YYYY/MM/DD or YYYY."""
+    raw = raw.strip().replace("-", "/")
+    return raw
+
 def _build_pubmed_filter():
-    start = pub_date_start.strip() or None
-    end = pub_date_end.strip() or None
+    start = _normalize_pubmed_date(pub_date_start.strip()) if pub_date_start.strip() else None
+    end = _normalize_pubmed_date(pub_date_end.strip()) if pub_date_end.strip() else None
     types = list(pub_types)
     if start or end or types:
         return PubMedFilter(pub_date_start=start, pub_date_end=end, publication_types=types)
@@ -383,6 +182,11 @@ st.caption(
 # ── Step 1: query input ──────────────────────────────────────────────────────
 
 st.subheader("Step 1 — Search Trials")
+st.caption(
+    f"Any year range in your query (e.g. '2018–2022') is compared against "
+    f"**{date_field_label}** from ClinicalTrials.gov. "
+    f"Change the date field in the sidebar if you want a different comparison."
+)
 
 query = st.text_area(
     "Trial search request",
@@ -400,7 +204,7 @@ if st.button("Search ClinicalTrials.gov", type="primary"):
                 selection_mode="auto",
                 max_auto_trials=max_auto_trials,
             )
-            packet = agent.run(query.strip())
+            packet = agent.run(query.strip(), date_field=date_field)
         st.session_state["trial_packet"] = packet
 
 # ── Step 2: trial selection ──────────────────────────────────────────────────
@@ -463,6 +267,11 @@ if "trial_packet" in st.session_state:
                 st.caption(f"{len(selected_labels)} trial(s) selected.")
 
         st.subheader("Step 2 — Find Papers")
+        st.caption(
+            "For each trial the pipeline first searches PubMed by **NCT ID** (precise, unfiltered). "
+            "If that returns nothing, it automatically falls back to a **drug + disease keyword search** "
+            "using your PubMed filters. Candidates are then judged by the AI — 🤖 marks its top pick."
+        )
 
         if st.button("Find Papers for Selected Trials", type="primary"):
             if not selected_labels:
@@ -474,7 +283,6 @@ if "trial_packet" in st.session_state:
 
                 pubmed_filter = _build_pubmed_filter()
                 paper_agent = PaperLinkAgent(
-                    mode=pubmed_mode,
                     draw_plots=False,
                     max_papers_per_query=max_papers,
                     pubmed_filter=pubmed_filter,
@@ -495,7 +303,6 @@ if "trial_packet" in st.session_state:
                 progress.progress(1.0, text="Paper search complete — review selections below.")
                 st.session_state["paper_finding_results"] = finding_results
                 st.session_state["paper_agent_config"] = {
-                    "mode": pubmed_mode,
                     "max_papers": max_papers,
                     "outcomes_raw": outcomes_raw.strip() or None,
                     "auto_primary": paper_agent.auto_primary,
@@ -518,7 +325,12 @@ if "trial_packet" in st.session_state:
 
                 with st.expander(f"{nct} — {(trial.get('brief_title') or '')[:80]}", expanded=True):
                     if not candidates:
-                        st.warning("No candidate papers found for this trial.")
+                        st.warning(
+                            f"No candidate papers found for {nct}. "
+                            "The NCT ID search and both fallback levels returned nothing. "
+                            "Try: (1) loosening or clearing PubMed filters, or "
+                            "(2) uploading a PDF directly in the Upload PDFs tab after extraction."
+                        )
                         continue
 
                     option_pmids = [str(c.get("pubmed_id")) for c in candidates]
@@ -537,6 +349,12 @@ if "trial_packet" in st.session_state:
                         format_func=lambda pmid: option_labels.get(pmid, pmid),
                         key=f"paper_sel_{nct}",
                     )
+                    if link_result.get("fallback_used"):
+                        st.caption(
+                            "⚠️ NCT ID search found no papers — candidates below are from a "
+                            "fallback drug + disease keyword search and may be less precise. "
+                            "Review the AI's reason carefully before extracting."
+                        )
                     st.caption(f"AI reason: {judge_result.get('reason', '—')}")
 
             st.subheader("Step 3 — Extract Outcomes")
@@ -544,7 +362,6 @@ if "trial_packet" in st.session_state:
                 cfg = st.session_state.get("paper_agent_config", {})
                 pubmed_filter = _build_pubmed_filter()
                 paper_agent = PaperLinkAgent(
-                    mode=cfg.get("mode", pubmed_mode),
                     draw_plots=False,
                     max_papers_per_query=cfg.get("max_papers", max_papers),
                     pubmed_filter=pubmed_filter,
@@ -582,18 +399,38 @@ if "trial_packet" in st.session_state:
                     trial_fields = item["link_result"].get("trial_fields") or item["trial"]
                     candidates = item["link_result"].get("all_candidates", [])
                     pubmed_record = item["survival_result"].get("pubmed_record")
+                    agent_judge = item["link_result"].get("judge_result") or {}
+
                     review = inspector.judge_trial_papers(trial_fields, candidates)
                     elig_review = (
                         inspector.judge_survival_plot_eligibility(pubmed_record)
                         if pubmed_record else None
                     )
+
+                    # Fix #2: tiebreaker when agent and inspector disagree on match
+                    tiebreak_result = None
+                    agent_match = bool(agent_judge.get("match_found"))
+                    insp_match = bool(review.get("match_found"))
+                    if agent_match != insp_match:
+                        nct = item["trial"].get("nct_id", "?")
+                        print(f"  [tiebreaker] {nct}: agent={agent_match} vs inspector={insp_match} — running tiebreaker…")
+                        try:
+                            tiebreak_result = inspector.tiebreak_paper_match(
+                                trial_fields, candidates, agent_judge, review
+                            )
+                            print(f"  [tiebreaker] Final: match={tiebreak_result.get('match_found')} "
+                                  f"confidence={tiebreak_result.get('confidence')}")
+                        except Exception as tb_exc:
+                            print(f"  [tiebreaker] Failed: {tb_exc}")
+
                     inspection_results.append({
                         "nct_id": item["trial"].get("nct_id"),
                         "trial_title": item["trial"].get("brief_title"),
                         "trial_paper_review": review,
                         "survival_eligibility_review": elig_review,
-                        "agent_judge_result": item["link_result"].get("judge_result"),
+                        "agent_judge_result": agent_judge,
                         "agent_eligibility_judgment": item["survival_result"].get("eligibility_judgment"),
+                        "tiebreak_result": tiebreak_result,
                     })
 
                 if paper_agent.auto_primary and all_plot_rows:
@@ -656,10 +493,10 @@ if "paper_results" in st.session_state:
                 )
             display_df = df[~df["is_subgroup"]].copy() if (has_subgroups and not show_subgroups) else df.copy()
 
-            # Build a display column that visually indents subgroup rows
+            # Build a display column that marks subgroup rows (leading spaces stripped by st.dataframe)
             def _arm_display(r):
                 if r.get("is_subgroup"):
-                    return f"  ↳ {r['arm_name']} › {r.get('subgroup_name', '')}"
+                    return f"[subgroup] {r['arm_name']} › {r.get('subgroup_name', '')}"
                 return r["arm_name"]
 
             display_df["arm"] = display_df.apply(_arm_display, axis=1)
@@ -855,179 +692,7 @@ if "paper_results" in st.session_state:
                 )
 
     # ── AI Plot ──────────────────────────────────────────────────────────────
-    with tab_ai_plot:
-        st.caption("Describe what you want to plot. AI generates matplotlib code, renders it, and self-reviews.")
-
-        ai_plot_request = st.text_input(
-            "What do you want to plot?",
-            placeholder="e.g. Forest plot of OS by arm for all trials, blue color palette",
-            key="ai_plot_request",
-        )
-
-        col_gen, col_clear = st.columns([1, 4])
-        with col_gen:
-            gen_clicked = st.button("Generate Plot", type="primary", key="ai_plot_gen")
-        with col_clear:
-            if st.button("Clear", key="ai_plot_clear"):
-                for k in ["ai_plot_code", "ai_plot_fig_b64", "ai_plot_review", "ai_plot_figs", "ai_plotter"]:
-                    st.session_state.pop(k, None)
-                st.rerun()
-
-        if gen_clicked:
-            eligible_rows = [r for r in all_plot_rows if r.get("plot_eligible")]
-            # Use all_plot_rows directly — values are already normalized floats or None
-            # (built by build_multi_outcome_plot_rows which calls _to_float_or_none).
-            # resolve_plot_rows() in the sandbox will run the evidence fallback and
-            # recalculate plot_eligible, so every recoverable row will be plotted.
-            ai_rows = [dict(r) for r in all_plot_rows]
-            st.session_state["ai_plot_rows"] = ai_rows
-            if not ai_rows:
-                st.warning("No plottable data available.")
-            elif not ai_plot_request.strip():
-                # Default: render same as Plots tab (uses only plot_eligible rows)
-                default_figs, _ = draw_all_outcome_plots(eligible_rows, specs, show=False)
-                if not default_figs:
-                    st.info("No plottable outcomes found.")
-                else:
-                    for k in ["ai_plot_code", "ai_plot_fig_b64", "ai_plot_review", "ai_plot_figs", "ai_plotter", "ai_plot_default_figs"]:
-                        st.session_state.pop(k, None)
-                    st.session_state["ai_plot_default_figs"] = default_figs
-            else:
-                from tools.sandbox_plot import run_sandboxed_plot
-                from tools.ai_plotter import AIPlotterAgent
-
-                plotter = AIPlotterAgent(model="openai/gpt-4o")
-                _df = pd.DataFrame(ai_rows)
-                _data = {"plot_rows": ai_rows, "df": _df}
-                MAX_RETRIES = 5
-                MAX_REVIEW_ROUNDS = 5
-
-                with st.status("Generating plot…", expanded=True) as status:
-                    st.write("Generating code…")
-                    code = plotter.generate_code(ai_rows, ai_plot_request.strip())
-                    st.session_state["ai_plot_code"] = code
-
-                    figs, b64, err = None, None, None
-                    for attempt in range(1, MAX_RETRIES + 1):
-                        st.write(f"Running code (attempt {attempt}/{MAX_RETRIES})…")
-                        figs, b64, err = run_sandboxed_plot(code, _data)
-                        if not err:
-                            break
-                        st.write(f"⚠️ Error: `{err.splitlines()[-1]}`")
-                        if attempt < MAX_RETRIES:
-                            st.write("Fixing error…")
-                            code = plotter.fix_code(code, err)
-                            st.session_state["ai_plot_code"] = code
-                        else:
-                            st.write("Max retries reached.")
-
-                    if err:
-                        status.update(label="Failed after retries", state="error")
-                        st.error(f"Could not render plot:\n```\n{err}\n```")
-                    else:
-                        # Auto review + refine loop (b64 of first figure sent for review)
-                        review = ""
-                        approved = False
-                        failed_attempts: list = []
-                        for round_n in range(1, MAX_REVIEW_ROUNDS + 1):
-                            st.write(f"Reviewing plot (round {round_n}/{MAX_REVIEW_ROUNDS})…")
-                            review = plotter.review_plot(b64, ai_plot_request.strip())
-                            # Only treat as approved if APPROVED appears as a standalone word
-                            # (not inside a checklist item like "1. PASS — looks approved")
-                            last_line = review.strip().splitlines()[-1].strip().upper() if review.strip() else ""
-                            if "APPROVED" in last_line and "ISSUES" not in last_line:
-                                st.write("✅ Plot approved.")
-                                approved = True
-                                break
-                            # Extract just the ISSUES section for the refine prompt
-                            issues_start = review.upper().find("ISSUES:")
-                            feedback = review[issues_start:].strip() if issues_start != -1 else review.strip()
-                            st.write(f"Issues found — refining… ({feedback[:120].strip()}…)")
-                            refined_code = plotter.refine_code(
-                                code, feedback, fig_base64=b64,
-                                failed_attempts=failed_attempts or None,
-                            )
-                            figs2, b64_2, err2 = run_sandboxed_plot(refined_code, _data)
-                            if err2:
-                                st.write(f"⚠️ Refinement error: `{err2.splitlines()[-1]}`")
-                                break
-                            code, figs, b64 = refined_code, figs2, b64_2
-                            st.session_state["ai_plot_code"] = code
-                            # Record this round's unresolved issues for next refinement call
-                            failed_attempts.append(f"Round {round_n}: {feedback[:200].strip()}")
-
-                        if not approved:
-                            st.write("⚠️ Max review rounds reached — plot shown with known issues.")
-
-                        st.session_state["ai_plot_figs"] = figs
-                        st.session_state["ai_plot_fig_b64"] = b64
-                        st.session_state["ai_plot_review"] = review
-                        st.session_state["ai_plot_approved"] = approved
-                        st.session_state["ai_plotter"] = plotter
-                        st.session_state.pop("ai_plot_default_figs", None)
-                        status.update(
-                            label="Plot ready ✅" if approved else "Plot shown (not fully approved) ⚠️",
-                            state="complete" if approved else "error",
-                        )
-
-        # Show default plots (empty input)
-        if "ai_plot_default_figs" in st.session_state:
-            for dfig in st.session_state["ai_plot_default_figs"]:
-                st.pyplot(dfig)
-
-        # Show current AI-generated plots (may be multiple figures)
-        if "ai_plot_figs" in st.session_state:
-            figs_to_show = st.session_state["ai_plot_figs"] or []
-            for i, f in enumerate(figs_to_show):
-                st.pyplot(f)
-            if figs_to_show and st.session_state.get("ai_plot_fig_b64"):
-                st.download_button(
-                    "Download first plot as PNG",
-                    data=base64.b64decode(st.session_state["ai_plot_fig_b64"]),
-                    file_name="ai_plot.png",
-                    mime="image/png",
-                )
-
-        # Show AI review summary (read-only, auto-applied above)
-        if "ai_plot_review" in st.session_state:
-            review_text = st.session_state["ai_plot_review"]
-            approved = st.session_state.get("ai_plot_approved", False)
-            with st.expander("AI Review", expanded=not approved):
-                if approved:
-                    st.success("AI: Plot passed all checks.")
-                else:
-                    st.warning("Plot shown but AI review found unresolved issues:")
-                    st.info(review_text[:800])
-
-        # Show generated code
-        if "ai_plot_code" in st.session_state:
-            with st.expander("Generated code", expanded=False):
-                st.code(st.session_state["ai_plot_code"], language="python")
-
-        # Follow-up refinement input
-        if "ai_plot_figs" in st.session_state:
-            followup = st.text_input(
-                "Ask for further changes",
-                placeholder="e.g. make the bars wider, use green colors, add gridlines",
-                key="ai_plot_followup",
-            )
-            if st.button("Apply Changes", key="ai_plot_followup_btn") and followup.strip():
-                plotter = st.session_state.get("ai_plotter")
-                if plotter:
-                    current_code = st.session_state.get("ai_plot_code", "")
-                    with st.spinner("Applying changes…"):
-                        new_code = plotter.refine_code(current_code, followup.strip())
-                    st.session_state["ai_plot_code"] = new_code
-                    from tools.sandbox_plot import run_sandboxed_plot
-                    ai_rows3 = st.session_state.get("ai_plot_rows") or [dict(r) for r in all_plot_rows]
-                    df3 = pd.DataFrame(ai_rows3)
-                    figs3, b64_3, err3 = run_sandboxed_plot(new_code, {"plot_rows": ai_rows3, "df": df3})
-                    if err3:
-                        st.error(err3)
-                    else:
-                        st.session_state["ai_plot_figs"] = figs3
-                        st.session_state["ai_plot_fig_b64"] = b64_3
-                        st.rerun()
+    render_ai_plot_tab(tab_ai_plot, all_plot_rows, specs)
 
     # ── QC Review ───────────────────────────────────────────────────────────
     with tab_qc:
@@ -1058,111 +723,20 @@ if "paper_results" in st.session_state:
                         st.write(f"Eligible: `{insp_e.get('eligible')}` | "
                                  f"Type: `{insp_e.get('paper_type')}`")
 
+                tb = item.get("tiebreak_result")
+                if tb:
+                    st.divider()
+                    st.markdown("**⚖️ Tiebreaker verdict** *(agents disagreed — third-pass resolution)*")
+                    tb_match = tb.get("match_found")
+                    tb_conf = tb.get("confidence", "?")
+                    if tb_match:
+                        st.success(f"Match: `True` | Confidence: `{tb_conf}`")
+                    else:
+                        st.warning(f"Match: `False` | Confidence: `{tb_conf}`")
+                    st.write(tb.get("reason", ""))
+
     # ── Upload PDFs ──────────────────────────────────────────────────────────
-    with tab_pdf:
-        st.markdown(
-            "For papers where only the abstract was available, upload the full PDF here "
-            "to re-run extraction with the full text. "
-            "Results will update the Summary Table and Plots automatically."
-        )
-
-        abstract_only = [
-            item for item in per_trial_results
-            if (item["survival_result"].get("survival_extraction") or {}).get("source_used") == "abstract"
-        ]
-
-        if not abstract_only:
-            st.info("All papers used full text — no PDF uploads needed.")
-
-        for item in abstract_only:
-            t = item["trial"]
-            sr = item["survival_result"]
-            jr = item["link_result"].get("judge_result", {}) or {}
-            pmid = jr.get("selected_pubmed_id", "?")
-            nct = t.get("nct_id", "?")
-
-            with st.expander(f"{nct} — PMID {pmid} (abstract only)"):
-                uploaded = st.file_uploader(
-                    f"Upload PDF for PMID {pmid}",
-                    type="pdf",
-                    key=f"pdf_{nct}_{pmid}",
-                )
-                if uploaded and st.button(f"Re-extract {nct}", key=f"rerun_{nct}_{pmid}"):
-                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                        tmp.write(uploaded.read())
-                        tmp_path = tmp.name
-                    try:
-                        from tools.pdf import read_pdf_text
-                        pdf_text = read_pdf_text(tmp_path)
-                        if not pdf_text:
-                            st.error("Could not extract text from PDF.")
-                        else:
-                            pubmed_record = sr.get("pubmed_record") or {}
-                            _agent = PaperLinkAgent(
-                                outcomes_raw=outcomes_raw.strip() or None,
-                                enable_pdf_prompt=False,
-                            )
-                            _agent._ensure_outcome_specs()
-
-                            with st.spinner("Re-extracting from PDF…"):
-                                new_ex = _agent.extract_outcomes_from_text(
-                                    pubmed_record, pdf_text, "user_pdf",
-                                    trial_id=nct, trial_label=t.get("brief_title"),
-                                )
-
-                            # ── write back into session state ──────────────
-                            # merge new PDF extraction with old to avoid losing arms
-                            updated_results = st.session_state["paper_results"]["per_trial_results"]
-                            for r in updated_results:
-                                if r["trial"].get("nct_id") == nct:
-                                    old_ex = r["survival_result"].get("survival_extraction") or {}
-                                    merged_ex = _merge_extractions(old_ex, new_ex)
-                                    # recompute plot_rows for merged arms
-                                    from tools.outcomes import build_multi_outcome_plot_rows
-                                    merged_ex["plot_rows"] = build_multi_outcome_plot_rows(
-                                        merged_ex,
-                                        _agent.outcome_specs or DEFAULT_OUTCOME_SPECS,
-                                        trial_id=nct,
-                                        trial_label=t.get("brief_title"),
-                                    )
-                                    r["survival_result"]["survival_extraction"] = merged_ex
-                                    r["plot_rows"] = merged_ex["plot_rows"]
-                                    new_ex = merged_ex  # use merged for success message
-                                    break
-
-                            # rebuild all_plot_rows and figures
-                            new_all_plot_rows = []
-                            for r in updated_results:
-                                new_all_plot_rows.extend(r.get("plot_rows", []))
-
-                            new_figs, new_unit_logs = [], []
-                            if new_all_plot_rows:
-                                new_figs, new_unit_logs = draw_all_outcome_plots(
-                                    new_all_plot_rows, specs, show=False
-                                )
-
-                            st.session_state["paper_results"]["per_trial_results"] = updated_results
-                            st.session_state["paper_results"]["all_plot_rows"] = new_all_plot_rows
-                            st.session_state["figures"] = new_figs
-                            st.session_state["unit_logs"] = new_unit_logs
-
-                            n_arms = len(new_ex.get("arms", []))
-                            n_plot_rows = len(new_ex.get("plot_rows", []))
-                            if n_plot_rows > 0:
-                                st.success(
-                                    f"Re-extraction complete — {n_arms} arm(s) extracted, "
-                                    f"{n_plot_rows} plottable row(s). Summary Table and Plots updated."
-                                )
-                            else:
-                                st.warning(
-                                    f"Re-extraction complete — {n_arms} arm(s) found but "
-                                    f"no plottable values (outcome may not be reported in this PDF). "
-                                    f"Check the raw result below."
-                                )
-                                st.json(new_ex)
-                            st.rerun()
-                    finally:
-                        os.unlink(tmp_path)
+    render_pdf_tab(tab_pdf, per_trial_results, outcomes_raw, specs)
 
     # ── Debug ────────────────────────────────────────────────────────────────
     with tab_debug:
@@ -1171,8 +745,8 @@ if "paper_results" in st.session_state:
             with st.expander(f"{nct} — raw link result"):
                 lr = item["link_result"]
                 st.write(f"**Query A:** `{lr.get('query_A')}`")
-                st.write(f"**Query B:** `{lr.get('query_B')}`")
-                st.write(f"**Query C:** `{lr.get('query_C')}`")
+                if lr.get("fallback_used"):
+                    st.warning("Fallback search was triggered (Query A returned 0 results).")
                 st.write(f"**Candidates:** {len(lr.get('all_candidates', []))}")
                 jr = lr.get("judge_result", {}) or {}
                 st.write(f"**Match:** `{jr.get('match_found')}` | "
@@ -1187,81 +761,4 @@ if "paper_results" in st.session_state:
                 st.write(f"**Notes:** {ex.get('notes')}")
 
     # ── Ask ──────────────────────────────────────────────────────────────────
-    with tab_ask:
-        st.caption(
-            "Ask anything about the papers or extraction results. "
-            "The agent reads the actual paper text retrieved during the pipeline run — "
-            "e.g. \"Why was only one arm found for NCT123?\", "
-            "\"What does the paper say about PFS in the control arm?\", "
-            "\"Is there a subgroup analysis reported?\""
-        )
-
-        if "chat_history" not in st.session_state:
-            st.session_state["chat_history"] = []
-
-        # Clear button
-        if st.button("Clear conversation", key="clear_chat"):
-            st.session_state["chat_history"] = []
-            st.rerun()
-
-        # Render existing history
-        for msg in st.session_state["chat_history"]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        # New user input
-        if question := st.chat_input("Ask about the results…"):
-            with st.chat_message("user"):
-                st.markdown(question)
-            st.session_state["chat_history"].append({"role": "user", "content": question})
-
-            # Build agent with current extraction context, replay history
-            from base_agent import BaseAgent
-            context = _build_chat_context(per_trial_results)
-            _chat_agent = BaseAgent(system_prompt=context)
-            for msg in st.session_state["chat_history"][:-1]:
-                if msg["role"] in ("user", "assistant"):
-                    _chat_agent.add_message(msg["role"], msg["content"])
-
-            with st.chat_message("assistant"):
-                with st.spinner(""):
-                    resp = _chat_agent._call_chat_model(
-                        user_message=question,
-                        temperature=0.2,
-                        tools=CHAT_TOOLS,
-                        tool_choice="auto",
-                    )
-                    msg = resp.choices[0].message
-
-                    reply = ""
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            fn = tc.function.name
-                            args = json.loads(tc.function.arguments)
-
-                            if fn == "plot_outcome":
-                                figs = _execute_plot_outcome(args, pr)
-                                if figs:
-                                    for fig in figs:
-                                        st.pyplot(fig)
-                                    outcome_label = args.get("outcome_key") or "all outcomes"
-                                    reply = f"Here is the plot for {outcome_label}."
-                                else:
-                                    reply = "No plottable data matched your request."
-
-                            elif fn == "show_table":
-                                df_chat = _execute_show_table(args, pr)
-                                if df_chat is not None and not df_chat.empty:
-                                    st.dataframe(df_chat, use_container_width=True)
-                                    reply = "Here is the summary table."
-                                else:
-                                    reply = "No data matched your request."
-
-                            else:
-                                reply = f"Unknown tool: {fn}"
-                    else:
-                        reply = msg.content or ""
-
-                st.markdown(reply)
-
-            st.session_state["chat_history"].append({"role": "assistant", "content": reply})
+    render_ask_tab(tab_ask, per_trial_results, pr)

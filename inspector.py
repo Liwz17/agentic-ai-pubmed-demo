@@ -9,6 +9,7 @@ from prompts import (
     INSPECTOR_SYSTEM_PROMPT,
     build_inspector_survival_eligibility_prompt,
     build_inspector_trial_paper_judging_prompt,
+    build_inspector_tiebreak_prompt,
 )
 from tools.pmc import get_best_text_for_extraction
 
@@ -111,11 +112,8 @@ class InspectorAgent(BaseAgent):
 
         try:
             return json.loads(content)
-        except Exception as exc:
-            raise ValueError(
-                "InspectorAgent did not return valid JSON for trial-paper judgment:\n"
-                f"{content}"
-            ) from exc
+        except Exception:
+            return {"match_found": False, "confidence": "low", "reason": "parse error — inspector could not parse LLM response"}
 
     def judge_survival_plot_eligibility(
         self,
@@ -167,6 +165,45 @@ class InspectorAgent(BaseAgent):
         result["source_used"] = source_used
         result["pmcid"] = pmcid
         return result
+
+    def tiebreak_paper_match(
+        self,
+        trial_fields: Dict[str, Any],
+        candidate_papers: list[Dict[str, Any]],
+        agent_verdict: Dict[str, Any],
+        inspector_verdict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Tiebreaker: called when main agent and inspector disagree on paper match.
+        Receives both verdicts and issues a definitive final result.
+        """
+        paper_blocks = []
+        for i, paper in enumerate(candidate_papers, start=1):
+            paper_blocks.append(
+                "\n".join([
+                    f"Candidate {i}",
+                    f"PMID: {paper.get('pubmed_id')}",
+                    f"Title: {paper.get('title')}",
+                    f"Abstract: {paper.get('abstract', '')[:300]}",
+                ])
+            )
+
+        prompt = build_inspector_tiebreak_prompt(
+            trial_fields=trial_fields,
+            papers_text="\n\n".join(paper_blocks),
+            agent_verdict=agent_verdict,
+            inspector_verdict=inspector_verdict,
+        )
+        self.clear()
+        response = self._call_chat_model(user_message=prompt, temperature=0.0)
+        content = response.choices[0].message.content or ""
+        content = self._clean_llm_json(content)
+        try:
+            return json.loads(content)
+        except Exception:
+            # Fallback: prefer whichever verdict has higher confidence
+            agent_conf = (agent_verdict.get("confidence") or "low").lower()
+            return agent_verdict if agent_conf == "high" else inspector_verdict
 
     @staticmethod
     def _clean_llm_json(content: str) -> str:

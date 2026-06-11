@@ -205,12 +205,7 @@ def run_conversation(
 if __name__ == "__main__":
     user_input = input("Enter your trial search request: ").strip()
 
-    mode = input("PubMed mode ('nct_only' or 'hybrid') [default: hybrid]: ").strip().lower()
-    if not mode:
-        mode = "hybrid"
-    if mode not in {"nct_only", "hybrid"}:
-        print("Invalid mode, falling back to 'hybrid'.")
-        mode = "hybrid"
+    mode = "nct_only"
 
     selection_mode = input(
         "Selection mode ('interactive' or 'auto') [default: interactive]: "

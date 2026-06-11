@@ -399,21 +399,16 @@ def build_query_B_llm(
 
     return _and_clause(clauses)
 
-def build_query_A(
-    fields: dict,
-    pubmed_filter: Optional["PubMedFilter"] = None,
-) -> Optional[str]:
+def build_query_A(fields: dict) -> Optional[str]:
+    """NCT ID lookup — no filters applied.
+    The NCT ID already uniquely identifies the trial; date/pub-type filters only hurt
+    recall here and would incorrectly trigger the fallback when the paper exists but is
+    outside the user's date range. Filters are applied by the fallback search instead.
+    """
     nct_id = fields.get("nct_id")
     if not nct_id:
         return None
-    clauses = [f"{nct_id}[All Fields]"]
-    if pubmed_filter:
-        date_clause = _date_filter_clause(
-            pubmed_filter.pub_date_start, pubmed_filter.pub_date_end
-        )
-        if date_clause:
-            clauses.append(date_clause)
-    return _and_clause(clauses)
+    return f"{nct_id}[All Fields]"
 
 
 def build_query_C(
