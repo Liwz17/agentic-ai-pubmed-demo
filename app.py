@@ -342,6 +342,15 @@ if "trial_packet" in st.session_state:
                     }
                     default_sel = [ai_pmid] if ai_pmid in option_pmids else []
 
+                    # If the LLM didn't pick a paper but Query A (NCT ID search) found one,
+                    # pre-select the first NCT ID result — it's nearly certain to be correct.
+                    if not default_sel and not link_result.get("fallback_used"):
+                        papers_A_pmids = [str(p.get("pubmed_id")) for p in link_result.get("papers_A", [])]
+                        for pmid in papers_A_pmids:
+                            if pmid in option_pmids:
+                                default_sel = [pmid]
+                                break
+
                     st.multiselect(
                         "Select papers to extract (leave empty to skip this trial)",
                         options=option_pmids,
